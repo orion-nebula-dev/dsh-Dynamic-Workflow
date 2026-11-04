@@ -1,0 +1,18 @@
+{
+  "id": "capsule-collaboration-example",
+  "title": "双代理分阶段协作",
+  "agents": {
+    "worker": { "title": "方案代理" },
+    "reviewer": { "title": "评审代理" }
+  },
+  "roles": {
+    "planner": { "title": "方案设计师", "prompt": "你负责制定技术方案。只输出方案，保持简洁，不执行外部操作。", "tools": [] },
+    "reviewer": { "title": "独立评审员", "prompt": "你负责独立检查方案。关注遗漏与验证方法，只输出改进意见。", "tools": [] },
+    "writer": { "title": "交付编写者", "prompt": "你负责综合评审意见交付最终方案。沿用本 Agent 的方案历史，修正遗漏，只输出最终方案。", "tools": [] }
+  },
+  "nodes": [
+    { "id": "plan", "title": "制定任务方案", "agentId": "worker", "role": "planner", "prompt": "用三句话列出一个技术方案应包含的内容，总计不超过 60 字。", "retrySafe": true },
+    { "id": "review", "title": "独立检查方案", "agentId": "reviewer", "role": "reviewer", "deps": ["plan"], "prompt": "根据 Dependencies 中的方案，指出一个最值得补充的检查点，不超过 30 字。", "retrySafe": true },
+    { "id": "deliver", "title": "按意见修订并交付", "agentId": "worker", "role": "writer", "deps": ["plan", "review"], "prompt": "综合本会话中的方案与 Dependencies 中的评审意见，输出不超过 80 字的最终方案。", "retrySafe": true }
+  ]
+}

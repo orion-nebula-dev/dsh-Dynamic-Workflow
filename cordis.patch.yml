@@ -1,0 +1,7 @@
+- id: workflow-ptc
+  name: '@deepseek-ai/dsh-workflow-ptc'
+  disabled: false
+- insert:
+    - id: dynamic-workflow
+      name: '@local/dynamic-workflow'
+      config: {}
