@@ -1,5 +1,9 @@
 # Dynamic Workflow
 
+简体中文 | [English](README.en.md)
+
+在 Harness 中运行 JSON 工作流，查看阶段进度和节点结果，选择子 Agent 模型，并在继续执行时复用有效的已完成结果。同一个胶囊代理可以跨阶段保留 Agent 会话和历史，每个阶段使用对应的角色提示词和工具策略。
+
 ## 安装
 
 克隆仓库到会话的工作目录，并在 Harness 插件管理中选择克隆后的 `dynamic-workflow` 目录安装插件包：
@@ -10,27 +14,49 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 
 插件启用后，在会话输入框使用 `/workflow`。
 
-## 在 Harness 中使用
+## 命令与快速开始
 
-在会话输入框输入 `/workflow` 查看命令用法。常用操作如下：
+在会话输入框输入 `/workflow` 查看用法。单独输入该命令会返回帮助；图形面板通过会话右上角的「工作流」入口打开。
+
+| 命令 | 操作 |
+| --- | --- |
+| `/workflow` 或 `/workflow help` | 查看命令用法 |
+| `/workflow run <JSON文件路径>` | 读取文件并启动工作流 |
+| `/workflow list` | 查看当前会话的运行记录和 `runId` |
+| `/workflow status <runId>` | 查看阶段进度和节点状态 |
+| `/workflow resume <runId>` | 使用保存的定义和进度继续执行 |
+| `/workflow stop <runId>` | 停止运行并等待子 Agent 清理 |
+| `/workflow models` | 查看可用模型的 `provider` 和 `model` 标识 |
+
+安装完成后，在克隆目录的上级工作区运行附带的只读示例：
 
 ```text
 /workflow run dynamic-workflow/workflow.example.json
-/workflow list
-/workflow status <runId>
-/workflow resume <runId>
-/workflow stop <runId>
 ```
 
-路径含空格时可以使用引号。需要指定模型、并发数或节点时，使用 JSON 参数，例如 `/workflow {"action":"run","workflowPath":"dynamic-workflow/workflow.example.json","concurrency":2}`。旧命令 `/dynamic-workflow` 保留为兼容入口。
+示例包含「制定任务方案」「独立检查方案」和「按意见修订并交付」三个节点。路径相对于会话的当前工作目录解析，含空格时可以加引号。运行命令会返回 `runId`，后续查询、停止和继续操作使用这个标识。
 
-助手调用 `dynamic_workflow` 的 `run` 或 `resume` 后，插件会在对应消息中显示工作流卡片。卡片横向展示阶段、状态连线和代理行，完成后在底部提供结果入口。展开后以纵向时间线显示阶段及节点结果。
+需要指定模型、并发数或节点时，使用 JSON 参数。先运行 `/workflow models`，再用返回的实际标识替换下面的占位符：
 
-会话右上角的「工作流」入口用于打开详情和运行配置。配置区域提供子 Agent 模型、并发数量和运行记录，也可以查看工作流定义。模型列表来自 Harness 当前配置。
+```text
+/workflow {"action":"run","workflowPath":"dynamic-workflow/workflow.example.json","provider":"<provider>","model":"<model>","concurrency":2}
+/workflow {"action":"resume","runId":"<runId>","provider":"<provider>","model":"<model>"}
+/workflow {"action":"status","runId":"<runId>","nodeId":"<nodeId>"}
+```
 
-在「工作流文件路径」中输入 `dynamic-workflow/workflow.example.json`，即可运行附带的只读示例。路径相对于会话的当前工作目录解析。示例包含「制定任务方案」「独立检查方案」和「按意见修订并交付」三个节点。
+旧命令 `/dynamic-workflow` 保留为兼容入口。
 
-工作流运行时，卡片定时读取节点状态。卡片显示的结果以 Host 返回值为准；读取失败时显示错误。助手创建新运行后，可以点击刷新按钮获取记录。
+## 查看进度与选择模型
+
+1. 点击会话右上角的「工作流」，打开详情面板。
+2. 打开「运行配置」，填写「工作流文件路径」。可以输入 `dynamic-workflow/workflow.example.json` 运行附带示例。
+3. 选择「子 Agent 模型」和「最多同时运行」的数量，再点击「运行工作流」。模型列表来自 Harness 当前配置。
+4. 在「运行记录」中选择本次运行，查看阶段进度。点击代理行查看节点结果，或点击「查看工作流定义」核对任务。
+5. 需要换模型时，选择新模型并点击「切换模型并继续」。具体恢复规则见下一节。
+
+助手调用 `dynamic_workflow` 的 `run` 或 `resume` 后，对应消息中会显示工作流卡片。卡片横向展示阶段、状态连线和代理行，完成后在底部提供结果入口。展开后以纵向时间线显示阶段及节点结果。
+
+工作流运行时，卡片定时读取节点状态。显示内容以 Host 返回值为准；读取失败时显示错误。通过命令或助手创建运行后，可以打开面板或点击刷新按钮获取记录。
 
 ## 切换模型并继续
 

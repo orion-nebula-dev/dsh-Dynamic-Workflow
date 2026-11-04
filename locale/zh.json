@@ -1,1 +1,6 @@
-{"meta":{"title":"动态工作流","description":"查看工作流进度，选择子 Agent 模型，并保留已完成结果继续执行。"}}
+{
+  "meta": {
+    "title": "动态工作流",
+    "description": "通过 /workflow 运行 JSON 工作流，查看阶段进度和节点结果，选择子 Agent 模型，并在继续执行时复用有效的已完成结果。\n\n命令：在会话输入框输入 /workflow 查看用法；/workflow run <JSON 文件路径> 启动运行；/workflow list 查看记录；/workflow status <runId> 查看进度；/workflow resume <runId> 继续执行；/workflow stop <runId> 停止运行；/workflow models 查看可用模型。\n\n操作：点击会话右上角「工作流」，在「运行配置」中填写工作流路径、选择子 Agent 模型和并发数，再点击「运行工作流」。点击代理行查看节点结果。需要换模型时，选择新模型并点击「切换模型并继续」；有效的已完成结果会复用，未完成阶段在原 Agent 会话身份及指纹验证通过后继续。\n\n高级参数：/workflow {\"action\":\"resume\",\"runId\":\"<runId>\",\"provider\":\"<provider>\",\"model\":\"<model>\"}。provider 和 model 使用 /workflow models 返回的实际标识。"
+  }
+}

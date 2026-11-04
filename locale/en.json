@@ -1,1 +1,6 @@
-{"meta":{"title":"Dynamic Workflow","description":"Track workflow progress, select subagent models, and continue with completed results preserved."}}
+{
+  "meta": {
+    "title": "Dynamic Workflow",
+    "description": "Use /workflow to run JSON workflows, inspect stage progress and node results, choose subagent models, and resume while reusing valid completed results.\n\nCommands: Enter /workflow in the composer for help; /workflow run <JSON-file-path> starts a run; /workflow list shows history; /workflow status <runId> shows progress; /workflow resume <runId> continues a run; /workflow stop <runId> stops it; /workflow models lists available models.\n\nOperation: Open Workflow in the session's upper-right corner. In Run configuration, enter the workflow path, select a subagent model and concurrency, then choose Run workflow. Click an agent row to inspect its node result. To change models, select the new model and choose Switch model and continue. Valid completed results are reused; unfinished stages continue after the original Agent session identity and fingerprint pass validation.\n\nAdvanced parameters: /workflow {\"action\":\"resume\",\"runId\":\"<runId>\",\"provider\":\"<provider>\",\"model\":\"<model>\"}. Use actual provider and model identifiers returned by /workflow models."
+  }
+}
