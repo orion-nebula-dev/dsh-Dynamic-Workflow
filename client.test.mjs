@@ -3,25 +3,148 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
-async function fixture() {
+async function fixture(hooks = {}, remote = {}) {
   let plugin;
   const registrations = [];
   const React = {
     createElement: (type, props, ...children) => ({ type, props: { ...props, children } }),
     useState: initial => [initial, () => {}], useRef: current => ({ current }),
-    useCallback: callback => callback, useEffect() {},
+    useCallback: callback => callback, useEffect() {}, ...hooks,
   };
   const source = await readFile(new URL('./client.js', import.meta.url), 'utf8');
   vm.runInNewContext(source, { window: { __ModuleLoader__: { load(definition) {
     plugin = definition.factory(name => { assert.equal(name, 'react'); return React; });
   } } } });
-  plugin.apply({ remote: {}, effect: setup => setup(), locale: { register: () => () => {} },
+  plugin.apply({ remote, effect: setup => setup(), locale: { register: () => () => {} },
     uiConversation: { events: { register: definition => { registrations.definition = definition; return () => {}; } } }, slots: {
     inject: (_name, setup) => setup(),
     register(options, component) { registrations.push({ options, component }); return () => {}; },
   } });
   return registrations;
 }
+
+function elements(tree, predicate) {
+  if (Array.isArray(tree)) return tree.flatMap(item => elements(item, predicate));
+  if (!tree || typeof tree !== 'object') return [];
+  return [...(predicate(tree) ? [tree] : []), ...elements(tree.props?.children, predicate)];
+}
+
+async function configFixture(form) {
+  const states = [];
+  let cursor = 0;
+  const registrations = await fixture({ useState(initial) {
+    const index = cursor++;
+    if (!(index in states)) states[index] = initial;
+    return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+  } });
+  const registration = registrations.find(item => item.options.name === 'plugins.row.config');
+  assert.ok(registration, 'plugin settings must expose its global mode control');
+  assert.equal(registration.options.key, '@local/dynamic-workflow#dynamic-workflow');
+  const render = () => { cursor = 0; return registration.component({ t: key => key, view: 'page', form }); };
+  return { render, registration };
+}
+
+async function bundleFixture(settings) {
+  const states = [], effects = [];
+  let cursor = 0;
+  const registrations = await fixture({
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in states)) states[index] = initial;
+      return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }];
+    },
+    useEffect(setup) { if (!effects.length) effects.push(setup); },
+  }, { settings });
+  const registration = registrations.find(item => item.options.name === 'plugins.bundle.config');
+  assert.ok(registration, 'the bundle detail page must show configuration directly');
+  assert.equal(registration.options.key, '@local/dynamic-workflow');
+  const render = () => { cursor = 0; return registration.component({ t: key => key, view: 'page' }); };
+  render();
+  const dispose = effects[0]();
+  await new Promise(resolve => setImmediate(resolve));
+  return { render, dispose };
+}
+
+test('bundle detail loads and persists the global switch through Host settings', async () => {
+  let value = false, revision = 4;
+  const writes = [];
+  const namespace = () => ({ ns: 'dynamic-workflow', value: { globalEnabled: value }, revision });
+  const settings = {
+    describe: async () => ({ ok: true, value: { writable: true, namespaces: [namespace()] } }),
+    mutate: async (...args) => {
+      writes.push(args);
+      value = args[1][0].value; revision++;
+      return { ok: true, value: namespace() };
+    },
+  };
+  const f = await bundleFixture(settings);
+  let form = f.render().props.form;
+  assert.equal(form.state.status, 'ready');
+  assert.equal(form.state.value.globalEnabled, false);
+  assert.equal(await form.mutate([{ op: 'set', path: ['globalEnabled'], value: true }], 4), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(writes)), [['dynamic-workflow', [{ op: 'set', path: ['globalEnabled'], value: true }], 4]]);
+  form = f.render().props.form;
+  assert.equal(form.state.value.globalEnabled, true);
+  assert.equal(form.state.revision, 5);
+  f.dispose();
+  const reopened = await bundleFixture(settings);
+  assert.equal(reopened.render().props.form.state.value.globalEnabled, true, 'reopening must read persisted Host values');
+  reopened.dispose();
+});
+
+test('bundle config reports Host read and write failures without claiming success', async () => {
+  const f = await bundleFixture({ describe: async () => ({ ok: false, error: { message: 'read refused' } }) });
+  assert.equal(f.render().props.form.state.status, 'error');
+  assert.match(f.render().props.form.state.error, /read refused/);
+  f.dispose();
+  const writable = await bundleFixture({
+    describe: async () => ({ ok: true, value: { writable: true, namespaces: [{ ns: 'dynamic-workflow', value: { globalEnabled: false }, revision: 2 }] } }),
+    mutate: async () => ({ ok: false, error: { message: 'revision changed' } }),
+  });
+  await assert.rejects(writable.render().props.form.mutate([{ op: 'set', path: ['globalEnabled'], value: true }], 2), /revision changed/);
+  assert.equal(writable.render().props.form.state.value.globalEnabled, false);
+  writable.dispose();
+});
+
+test('global mode saves only its own setting against the accepted revision', async () => {
+  const writes = [];
+  const form = { state: { status: 'ready', writable: true, value: { globalEnabled: false, unrelated: 42 }, revision: 7 }, mutate: async (...args) => { writes.push(args); return true; } };
+  const { render, registration } = await configFixture(form);
+  assert.equal(typeof registration.component({ t: key => key, view: 'summary' }), 'string');
+  let control = elements(render(), item => item.props.role === 'switch')[0];
+  assert.equal(control.props['aria-checked'], false);
+  await control.props.onClick();
+  assert.deepEqual(JSON.parse(JSON.stringify(writes)), [[[ { op: 'set', path: ['globalEnabled'], value: true } ], 7]]);
+  form.state = { ...form.state, value: { globalEnabled: true }, revision: 8 };
+  const enabledView = render();
+  control = elements(enabledView, item => item.props.role === 'switch')[0];
+  assert.equal(control.props['aria-checked'], true);
+  const status = elements(enabledView, item => item.props.className === 'dwf-config-status')[0];
+  assert.equal(status.props.children[0], 'enabled');
+  await control.props.onClick();
+  assert.equal(writes[1][0][0].value, false);
+  assert.equal(writes[1][1], 8);
+});
+
+for (const state of [undefined, { status: 'loading', writable: true }, { status: 'ready', writable: false, value: {} }]) test(`global mode cannot mutate unavailable or read-only config: ${JSON.stringify(state)}`, async () => {
+  let writes = 0;
+  const { render } = await configFixture(state ? { state, mutate: () => { writes++; } } : undefined);
+  const control = elements(render(), item => item.props.role === 'switch')[0];
+  if (control) {
+    assert.equal(control.props.disabled, true);
+    await control.props.onClick();
+  }
+  assert.equal(writes, 0);
+});
+
+for (const failure of ['rejected', 'thrown']) test(`global mode reports ${failure} saves without claiming enabled`, async () => {
+  const form = { state: { status: 'ready', writable: true, value: {}, revision: 1 }, mutate: async () => { if (failure === 'thrown') throw new Error('save failed'); return false; } };
+  const { render } = await configFixture(form);
+  await elements(render(), item => item.props.role === 'switch')[0].props.onClick();
+  const tree = render();
+  assert.equal(elements(tree, item => item.props.role === 'switch')[0].props['aria-checked'], false);
+  assert.equal(elements(tree, item => item.props.role === 'alert').length, 1);
+});
 
 // The hook adapter checks first-render and native tool-result compatibility.
 // Actual placement, appearance and controls are verified in the real browser.

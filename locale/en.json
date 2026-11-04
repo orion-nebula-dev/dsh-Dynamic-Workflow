@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Dynamic Workflow",
-    "description": "Use /workflow to run JSON workflows, inspect stage progress and node results, choose subagent models, and resume while reusing valid completed results.\n\nCommands: Enter /workflow in the composer for help; /workflow run <JSON-file-path> starts a run; /workflow list shows history; /workflow status <runId> shows progress; /workflow resume <runId> continues a run; /workflow revise {\"runId\":\"<runId>\",\"workflowPath\":\"<path>\",\"revisionReason\":\"<message>\"} revises a run after stopping it; /workflow stop <runId> stops it; /workflow models lists available models.\n\nOperation: Open Workflow in the session's upper-right corner. In Run configuration, enter the workflow path, select a subagent model and concurrency, then choose Run workflow. Click an agent row to inspect its node result. To change models, select the new model and choose Switch model and continue. Valid completed results are reused; unfinished stages continue after the original Agent session identity and fingerprint pass validation.\n\nGlobal automatic workflow routing is off by default and can be enabled in plugin configuration. When enabled, each human message in a root session is classified by the current session model before the assistant proceeds."
+    "description": "Run JSON workflows, inspect stage progress and node results, choose subagent models, and resume with valid completed results reused."
   }
 }

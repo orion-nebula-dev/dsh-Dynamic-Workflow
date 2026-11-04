@@ -2,20 +2,18 @@ export function isRootAgent(agent) {
   return Boolean(agent?.id) && !agent?.session?.header?.parentSession;
 }
 
-function textFromChunk(chunk) {
-  if (chunk?.type === 'text-delta') return chunk.text ?? '';
-  if (chunk?.type === 'block-end' && chunk.block?.type === 'text') return chunk.block.text ?? '';
-  return '';
-}
-
 export async function classifyMessage({ llm, config, message, signal }) {
   if (!llm?.stream || !config?.provider || !config?.model) return { action: 'direct' };
-  const chunks = [];
+  const blocks = new Map();
   try {
     for await (const chunk of llm.stream({ provider: config.provider, model: config.model, messages: [
       { role: 'user', content: [{ type: 'text', text: `Classify this user message for workflow routing. Return JSON only: {"action":"direct"|"create"|"revise","reason":"short reason"}. Choose create only for multi-step work; choose revise only if an active workflow must change.\n\nUser message:\n${message}` }] },
-    ], signal, purpose: 'session-title' })) chunks.push(textFromChunk(chunk));
-    const parsed = JSON.parse(chunks.join('').trim());
+    ], signal })) {
+      const index = chunk.index ?? 0;
+      if (chunk.type === 'text-delta') blocks.set(index, (blocks.get(index) ?? '') + (chunk.text ?? ''));
+      if (chunk.type === 'block-end' && chunk.block?.type === 'text') blocks.set(index, chunk.block.text ?? '');
+    }
+    const parsed = JSON.parse([...blocks.entries()].sort(([a], [b]) => a - b).map(([, text]) => text).join('').trim());
     if (!['direct', 'create', 'revise'].includes(parsed?.action)) return { action: 'direct' };
     return { action: parsed.action, ...(typeof parsed.reason === 'string' && parsed.reason.trim() ? { reason: parsed.reason.trim().slice(0, 500) } : {}) };
   } catch { return { action: 'direct' }; }

@@ -115,21 +115,130 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
     return { id: `w${requests.length}`, meta: request.meta, result, cancel, async dispose() { await result; await onDispose(); disposed++; } };
   } };
   const services = { fs, workingDirectory: { ensure: async () => root }, workflowEngine: engine,
+    ...(options.settings ? { settings: options.settings } : {}),
     ...(options.native ? { subagents, agents: { get: id => live.get(id) } } : {}) };
   const owner = { id: 'owner', ctx: { get: key => services[key] } };
   const storageDomain = durableStore();
-  const ctx = { storageDomain, commands: { register(value) { command = value; return () => { command = undefined; }; } }, tools: { register(value) { tool = value; return () => { tool = undefined; }; } }, effect(fn) { const off = fn(); effects.push(off); return off; }, ...(options.native ? { on } : {}) };
+  const ctx = { storageDomain, commands: { register(value) { command = value; return () => { command = undefined; }; } }, tools: { register(value) { tool = value; return () => { tool = undefined; }; } }, effect(fn) { const off = fn(); effects.push(off); return off; }, ...(options.settings ? { settings: options.settings } : {}), ...(options.native ? { on } : {}) };
   const module = await import('./index.js').catch(error => error.code === 'ERR_MODULE_NOT_FOUND' ? {} : Promise.reject(error));
   assert.equal(typeof module.apply, 'function', 'Host plugin must export apply');
-  await module.apply(ctx);
+  await module.apply(ctx, options.config);
   t.after(async () => { for (const effect of effects.reverse()) await effect?.(); await rm(root, { recursive: true, force: true }); });
   return { root, owner, requests, storageDomain, services, native: { catalog, histories, continuations, live, policyActivations }, restart: () => module.apply(ctx), get disposed() { return disposed; },
-    get command() { return command; },
+    get command() { return command; }, listeners,
     write: workflow => writeFile(join(root, 'flow.json'), JSON.stringify(workflow)),
     call: (args, agent = owner, signal = new AbortController().signal) => tool.execute(args, { agent, signal }),
     unload: async () => { for (const effect of effects.splice(0).reverse()) await effect?.(); },
   };
 }
+test('global router reads a live setting and ignores its own instructions', async t => {
+  let enabled = false, calls = 0;
+  const setting = { get: () => enabled };
+  const f = await fixture(t, undefined, undefined, { native: true, config: { globalEnabled: setting } });
+  f.owner.session = { header: {}, requestHeader: () => ({ config: { provider: 'test', model: 'test' } }) };
+  f.services.llm = { async *stream() { calls++; yield { type: 'text-delta', text: '{"action":"create"}' }; } };
+  const hook = [...f.listeners.get('agent/pre-step')][0];
+  const original = { kind: 'enter', messages: [{ id: 'plan-prompt', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'make a plan' }] }] };
+  const payload = { agent: f.owner, messages: original.messages, signal: new AbortController().signal };
+  assert.deepEqual(await hook(payload, async () => original), original);
+  assert.equal(calls, 0);
+  enabled = true;
+  const rejected = { kind: 'reject' };
+  assert.equal(await hook(payload, async () => rejected), rejected);
+  assert.equal(calls, 0);
+  const routed = await hook(payload, async () => ({ ...original, startsRequestSeries: true }));
+  assert.equal(routed.startsRequestSeries, true);
+  assert.equal(typeof routed.messages.at(-1).id, 'string');
+  assert.deepEqual(routed.messages.at(-1).source, { kind: 'dynamic-workflow' });
+  assert.equal(Object.isFrozen(routed.messages.at(-1)), true);
+  assert.equal(calls, 1);
+  await hook({ ...payload, messages: routed.messages }, async () => routed);
+  assert.equal(calls, 1);
+});
+
+for (const action of ['direct', 'create', 'revise']) test(`global router classifies each submitted prompt once when routing ${action}`, async t => {
+  const f = await fixture(t, undefined, undefined, { native: true, config: { globalEnabled: true } });
+  f.owner.session = { header: {}, requestHeader: () => ({ config: { provider: 'test', model: 'test' } }) };
+  let calls = 0;
+  f.services.llm = { async *stream() { calls++; yield { type: 'text-delta', text: JSON.stringify({ action }) }; } };
+  const hook = [...f.listeners.get('agent/pre-step')][0];
+  const prompt = { id: 'human-1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'same prompt' }] };
+  const signal = new AbortController().signal;
+  const step = async (messages, turn, number) => {
+    const result = { kind: 'enter', messages };
+    return hook({ agent: f.owner, messages, turn, step: number, signal }, async () => result);
+  };
+  const first = await step([prompt], 1, 1);
+  assert.equal(calls, 1);
+  await step([{ ...prompt }], 1, 2);
+  await step([{ ...prompt }], 2, 3);
+  assert.equal(calls, 1, 'model steps and retries must not classify a submitted prompt again');
+  for (const messages of [[], [{ id: 'reply', role: 'assistant', content: [{ type: 'text', text: 'model reply' }] }], [{ id: 'goal', role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: 'continue' }] }]]) await step(messages, 2, 4);
+  assert.equal(calls, 1, 'replies and automatic continuation are not user submissions');
+  const routerMessages = first.messages.filter(message => message.source?.kind === 'dynamic-workflow');
+  await step([...routerMessages, { ...prompt, id: 'human-2' }], 3, 5);
+  assert.equal(calls, 2, 'sending the same text again is a new submission, even alongside plugin messages');
+});
+
+test('global router judges queued human prompts separately', async t => {
+  const f = await fixture(t, undefined, undefined, { native: true, config: { globalEnabled: true } });
+  f.owner.session = { header: {}, requestHeader: () => ({ config: { provider: 'test', model: 'test' } }) };
+  const calls = [];
+  f.services.llm = { async *stream(options) { calls.push(options.messages[0].content[0].text); yield { type: 'text-delta', text: '{"action":"direct"}' }; } };
+  const messages = ['first prompt', 'second prompt'].map((text, index) => ({ id: `queued-${index}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }));
+  const hook = [...f.listeners.get('agent/pre-step')][0];
+  await hook({ agent: f.owner, messages, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages }));
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].endsWith('first prompt'));
+  assert.ok(calls[1].endsWith('second prompt'));
+});
+
+test('global router uses the selected model before the first request and after a switch', async t => {
+  const f = await fixture(t, undefined, undefined, { native: true, config: { globalEnabled: true } });
+  const calls = [];
+  f.owner.session = { header: {}, requestHeader: () => undefined };
+  f.services.llm = { async *stream(options) { calls.push(options); yield { type: 'text-delta', text: '{"action":"direct"}' }; } };
+  const observe = [...(f.listeners.get('system-prompt/assemble') ?? [])][0];
+  assert.equal(typeof observe, 'function');
+  const hook = [...f.listeners.get('agent/pre-step')][0];
+  const messages = [{ id: 'before-model-switch', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hello' }] }];
+  const payload = { agent: f.owner, messages, signal: new AbortController().signal };
+  const assembly = { sections: [], contexts: [], tools: [], variables: { provider: 'new', model: 'first' } };
+  assert.equal(await observe({}, { scope: f.owner }, async () => assembly), assembly);
+  await hook(payload, async () => ({ kind: 'enter', messages }));
+  assert.equal(calls[0]?.model, 'first');
+  f.owner.session.requestHeader = () => ({ config: { provider: 'old', model: 'stale' } });
+  await observe({}, { scope: f.owner }, async () => ({ ...assembly, variables: { provider: 'new', model: 'switched' } }));
+  const nextMessages = [{ ...messages[0], id: 'after-model-switch' }];
+  await hook({ ...payload, messages: nextMessages }, async () => ({ kind: 'enter', messages: nextMessages }));
+  assert.equal(calls[1]?.model, 'switched');
+  const injected = [{ role: 'user', source: { kind: 'goal' }, content: [{ type: 'text', text: 'continue the task' }] }];
+  await hook({ ...payload, messages: injected }, async () => ({ kind: 'enter', messages: injected }));
+  assert.equal(calls.length, 2, 'automatic plugin messages are not new human requests');
+});
+
+test('settings reads the dynamic workflow value and writes with its described revision', async t => {
+  const calls = [];
+  let value = false, revision = 7;
+  const settings = {
+    describe() { return [{ ns: 'dynamic-workflow', value: { globalEnabled: value }, revision }]; },
+    async mutate(...args) { calls.push(args); value = args[1][0].value; revision++; },
+  };
+  const f = await fixture(t, undefined, undefined, { settings });
+  assert.deepEqual(await f.call({ action: 'settings' }), { globalEnabled: false, revision: 7, ns: 'dynamic-workflow' });
+  assert.deepEqual(await f.call({ action: 'settings', globalEnabled: true }), { globalEnabled: true, revision: 8, ns: 'dynamic-workflow' });
+  assert.deepEqual(calls, [['dynamic-workflow', [{ op: 'set', path: ['globalEnabled'], value: true }], 7]]);
+});
+
+test('settings propagates a rejected persistence write', async t => {
+  const settings = {
+    describe() { return [{ ns: 'dynamic-workflow', value: { globalEnabled: false }, revision: 3 }]; },
+    async mutate() { throw new Error('settings conflict'); },
+  };
+  const f = await fixture(t, undefined, undefined, { settings });
+  await assert.rejects(() => f.call({ action: 'settings', globalEnabled: true }), /settings conflict/);
+});
+
 test('one capsule reuses its native Agent for successive stages', async t => {
   const f = await fixture(t, async () => 'stage completed', undefined, { native: true });
   await f.write({ id: 'capsules', nodes: [

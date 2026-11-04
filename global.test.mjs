@@ -9,6 +9,17 @@ test('classifies a parent message with the current session model and parses JSON
   assert.deepEqual(result, { action: 'revise', reason: 'new acceptance criteria' });
   assert.equal(calls[0].provider, 'p');
   assert.equal(calls[0].model, 'm');
+  assert.equal(calls[0].purpose, undefined);
+});
+
+test('does not duplicate final text blocks after streamed deltas', async () => {
+  const text = '{"action":"create"}';
+  const llm = { async *stream() {
+    yield { type: 'text-delta', index: 0, text };
+    yield { type: 'block-end', index: 0, block: { type: 'text', text } };
+    yield { type: 'finish', reason: { kind: 'stop' } };
+  } };
+  assert.deepEqual(await classifyMessage({ llm, config: { provider: 'p', model: 'm' }, message: 'task' }), { action: 'create' });
 });
 
 test('falls back to direct handling when classifier output is invalid', async () => {

@@ -8,6 +8,11 @@ window.__ModuleLoader__.load({
     const NS = 'local-dynamic-workflow';
     const dictionaries = {
       zh: {
+        configIntro: '设置动态工作流的全局任务判断。', globalMode: '全局模式',
+        globalModeNote: '开启后，由当前会话模型判断每条用户消息是否适合工作流。',
+        globalModeCost: '仅作用于主会话，会增加模型请求的耗时与用量；关闭后仍可手动运行。',
+        configUnavailable: '配置表单暂不可用。请重新打开插件设置。', configLoading: '正在加载配置…', configReadOnly: '当前配置为只读。',
+        configSaveFailed: '配置未保存。请刷新设置后重试。', enabled: '已开启', disabled: '已关闭',
         title: '动态工作流', workflow: '工作流', agents: '个代理', workflowRunning: '工作流运行中', workflowCompleted: '工作流已完成', configure: '运行配置', stages: '个阶段', steps: '步', oneTask: '1 个任务', atMost: '最多', decrease: '减少并发', increase: '增加并发', save: '保存', completedNote: '本次运行已完成。点击下方代理行可查看节点结果。', open: '打开工作流', close: '收起详情', refresh: '刷新',
         empty: '当前会话还没有工作流。输入工作流 JSON 文件路径，或让助手根据任务创建工作流。',
         path: '工作流文件路径', pathPlaceholder: '例如 workflow.json', start: '运行工作流',
@@ -26,6 +31,11 @@ window.__ModuleLoader__.load({
         invalidConcurrency: '同时运行的节点数量须为 1–8 的整数。', legacy: '此记录未保存工作流定义。请填写原文件路径重新运行。',
       },
       en: {
+        configIntro: 'Configure global task classification for dynamic workflows.', globalMode: 'Global mode',
+        globalModeNote: 'Let the current session model check each human message for workflow suitability.',
+        globalModeCost: 'Root sessions only. Adds model latency and usage; manual workflows remain available when disabled.',
+        configUnavailable: 'The configuration form is unavailable. Reopen plugin settings.', configLoading: 'Loading configuration…', configReadOnly: 'This configuration is read-only.',
+        configSaveFailed: 'Settings were not saved. Refresh settings and try again.', enabled: 'Enabled', disabled: 'Disabled',
         title: 'Dynamic workflow', workflow: 'Workflow', agents: 'agents', workflowRunning: 'Workflow running', workflowCompleted: 'Workflow completed', configure: 'Run configuration', stages: 'stages', steps: 'steps', oneTask: '1 task', atMost: 'At most', decrease: 'Decrease concurrency', increase: 'Increase concurrency', save: 'Save', completedNote: 'This run is complete. Select an agent row below to view its result.', open: 'Open workflow', close: 'Collapse details', refresh: 'Refresh',
         empty: 'No workflow in this session yet. Enter a workflow JSON path or ask the assistant to create one.',
         path: 'Workflow file path', pathPlaceholder: 'For example workflow.json', start: 'Run workflow',
@@ -301,6 +311,51 @@ window.__ModuleLoader__.load({
           h('footer', { className: 'dwf-footer' }, t('saved'), active?.resumedFrom && h('span', { className: 'dwf-short-id' }, ` · ${t('from')} ${active.resumedFrom}`))));
       return h('section', { className: `dwf dwf-placement-${placement}`, 'aria-label': t('title') }, h('style', null, css), compact, panel);
     }
+    const configCss = `
+.dwf-config{box-sizing:border-box;width:100%;color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.6}
+.dwf-config *{box-sizing:border-box}.dwf-config-row{display:flex;align-items:flex-start;justify-content:space-between;gap:24px;padding:4px 0}
+.dwf-config-copy{min-width:0}.dwf-config-label{display:block;font-size:14px;font-weight:600}.dwf-config p{margin:4px 0 0;color:var(--dsw-alias-label-secondary)}
+.dwf-config .dwf-config-hint{font-size:12px}.dwf-config-control{display:flex;align-items:center;flex:none;gap:10px;padding-top:2px}.dwf-config-status{font-size:12px;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+.dwf-config button.dwf-config-switch{position:relative;display:inline-flex;align-items:center;width:36px;height:20px;flex:none;margin:0;padding:2px;border:0;border-radius:999px;background:var(--dsw-alias-border-l2);cursor:pointer;transition:background .15s ease}
+.dwf-config button.dwf-config-switch[aria-checked="true"]{background:var(--dsw-alias-label-primary)}.dwf-config-switch-thumb{width:16px;height:16px;border-radius:50%;background:var(--dsw-alias-bg-base);transition:transform .15s ease;pointer-events:none}
+.dwf-config-switch[aria-checked="true"] .dwf-config-switch-thumb{transform:translateX(16px)}.dwf-config button:disabled{cursor:default;opacity:.45}.dwf-config button:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:4px}
+.dwf-config .dwf-config-error{color:var(--dsw-alias-state-error-primary);font-size:12px}.dwf-config-notice{font-size:12px}
+@media(max-width:480px){.dwf-config-row{gap:16px}.dwf-config-status{display:none}}@media(prefers-reduced-motion:reduce){.dwf-config-switch,.dwf-config-switch-thumb{transition:none!important}}
+`;
+    function WorkflowConfigView({ t, view, form }) {
+      const [busy, setBusy] = useState(false);
+      const [error, setError] = useState('');
+      const saving = useRef(false);
+      const state = form?.state;
+      const ready = state?.status === 'ready';
+      const writable = ready && state.writable;
+      const enabled = state?.value?.globalEnabled === true;
+      async function toggle() {
+        if (!writable || saving.current) return;
+        saving.current = true;
+        setBusy(true); setError('');
+        try {
+          const accepted = await form.mutate([{ op: 'set', path: ['globalEnabled'], value: !enabled }], state.revision);
+          if (accepted === false) setError(t('configSaveFailed'));
+        } catch (failure) {
+          setError(`${t('configSaveFailed')} ${failure?.message || String(failure)}`);
+        } finally { saving.current = false; setBusy(false); }
+      }
+      if (view === 'summary') return t('configIntro');
+      return h('section', { className: 'dwf-config', 'aria-label': t('title') },
+        h('style', null, configCss),
+        h('div', { className: 'dwf-config-row' },
+          h('div', { className: 'dwf-config-copy' },
+            h('strong', { className: 'dwf-config-label' }, t('globalMode')),
+            h('p', null, t('globalModeNote')),
+            h('p', { className: 'dwf-config-hint' }, t('globalModeCost'))),
+          h('div', { className: 'dwf-config-control' },
+            h('span', { className: 'dwf-config-status', role: 'status' }, ready ? t(enabled ? 'enabled' : 'disabled') : ''),
+            h('button', { type: 'button', role: 'switch', 'aria-label': t('globalMode'), 'aria-checked': enabled, 'aria-busy': busy, className: 'dwf-config-switch', disabled: !writable || busy, onClick: toggle }, h('span', { className: 'dwf-config-switch-thumb', 'aria-hidden': true })))),
+        !ready && h('p', { className: 'dwf-config-notice', role: state?.error ? 'alert' : 'status' }, state?.error || t(form ? 'configLoading' : 'configUnavailable')),
+        ready && !writable && h('p', { className: 'dwf-config-notice', role: 'status' }, t('configReadOnly')),
+        error && h('p', { className: 'dwf-config-error', role: 'alert' }, error));
+    }
     function WorkflowToolCard(props) {
       const block = props.block;
       const text = props.phase === 'result' ? (block.content || []).filter(part => part.type === 'text').map(part => part.text).join('\n') : '';
@@ -346,9 +401,46 @@ window.__ModuleLoader__.load({
       return props.workflowSessionId ? h(WorkflowDock, { ...props, key: props.workflowSessionId }) : null;
     }
     return {
-      inject: ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'uiConversation'],
+      inject: ['slots', 'locale', 'remote', 'remote.commands', 'remote.session', 'remote.settings', 'uiConversation'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, dictionaries), 'dynamic-workflow: locale');
+        function BundleConfigView(props) {
+          const [state, setState] = useState({ status: 'loading', writable: false });
+          const mounted = useRef(true);
+          async function load() {
+            try {
+              const result = await ctx.remote.settings.describe();
+              if (!result.ok) throw new Error(result.error?.message || props.t('configUnavailable'));
+              const namespace = result.value.namespaces.find(item => item.ns === 'dynamic-workflow');
+              if (!namespace) throw new Error(props.t('configUnavailable'));
+              if (mounted.current) setState({ ...namespace, status: 'ready', writable: result.value.writable });
+            } catch (failure) {
+              if (mounted.current) setState({ status: 'error', writable: false, error: failure?.message || String(failure) });
+            }
+          }
+          useEffect(() => {
+            mounted.current = true;
+            void load();
+            return () => { mounted.current = false; };
+          }, []);
+          const form = { state, async mutate(ops, revision) {
+            if (state.status !== 'ready' || !state.writable) throw new Error(props.t('configReadOnly'));
+            const result = await ctx.remote.settings.mutate(state.ns, ops, revision);
+            if (!result.ok) {
+              await load();
+              throw new Error(result.error?.message || props.t('configSaveFailed'));
+            }
+            if (mounted.current) setState({ ...result.value, status: 'ready', writable: state.writable });
+            return true;
+          } };
+          return h(WorkflowConfigView, { ...props, form });
+        }
+        ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+          name: 'plugins.bundle.config', key: '@local/dynamic-workflow', locale: NS,
+        }, BundleConfigView));
+        ctx.slots.inject('plugins.row.config', () => ctx.slots.register({
+          name: 'plugins.row.config', key: '@local/dynamic-workflow#dynamic-workflow', locale: NS,
+        }, WorkflowConfigView));
         ctx.effect(() => ctx.uiConversation.events.register(workflowDefinition), 'dynamic-workflow: conversation row');
         ctx.slots.inject('conversation.chat.node', () => ctx.slots.register({ name: 'conversation.chat.node', key: 'dynamic-workflow', locale: NS, inject: sessionId => ({ workflowSessionId: sessionId, workflowRemote: ctx.remote }) }, WorkflowConversationCard));
         ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({ name: 'tool.call.toolview', key: 'dynamic_workflow', locale: NS, inject: sessionId => ({ workflowSessionId: sessionId, workflowRemote: ctx.remote }) }, WorkflowToolCard));

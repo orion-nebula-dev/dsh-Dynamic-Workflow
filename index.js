@@ -7,8 +7,8 @@ import { classifyMessage, isRootAgent, routerInstruction } from './global.mjs';
 
 const memberLabel = (runId, nodeId) => `dw-${runId}-${createHash('sha256').update(nodeId).digest('hex').slice(0, 12)}`;
 
-export const inject = ['tools', 'storageDomain', 'commands'];
-export const Config = schema.object({ globalEnabled: schema.boolean().default(false).description('Classify every human message in root sessions with the current session model before handling it.') });
+export const inject = ['tools', 'storageDomain', 'commands', 'settings'];
+export const Config = schema.object({ globalEnabled: schema.boolean().default(false).description('Classify every human message in root sessions with the current session model before handling it.').volatile() });
 const SCRIPT = 'return await agent(args.prompt, args.options);';
 const LIMIT = 12000;
 
@@ -119,18 +119,50 @@ export async function apply(ctx, config = {}) {
     for (const handle of record.handles) handle.cancel('Dynamic workflow stopped');
     await record.done;
   }
-  if (config.globalEnabled && typeof ctx.on === 'function') ctx.effect(() => ctx.on('agent/pre-step', async (payload, next) => {
+  const assembledRoutes = new WeakMap();
+  if (typeof ctx.on === 'function') ctx.effect(() => ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+    const result = await next();
+    const scope = context.scope;
+    if (scope && typeof scope === 'object') {
+      const { provider, model } = result.variables;
+      if (provider && model) assembledRoutes.set(scope, { provider, model });
+      else assembledRoutes.delete(scope);
+    }
+    return result;
+  }, { prepend: true }));
+  const judgedPrompts = new WeakMap();
+  if (typeof ctx.on === 'function') ctx.effect(() => ctx.on('agent/pre-step', async (payload, next) => {
+    const enabled = typeof config.globalEnabled?.get === 'function' ? config.globalEnabled.get() : config.globalEnabled;
+    if (enabled !== true) return next();
     const agent = payload?.agent;
-    if (!isRootAgent(agent) || !Array.isArray(payload.messages) || payload.messages.some(message => String(message.content ?? '').includes('[Dynamic Workflow router]'))) return next();
-    const text = payload.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === 'text').map(block => block.text) : [message.content]).filter(Boolean).join('\\n');
-    if (!text.trim()) return next();
+    if (!isRootAgent(agent) || !Array.isArray(payload.messages)) return next();
+    const prompts = payload.messages.filter(message => message.role === 'user' && message.source?.kind === 'user' && typeof message.id === 'string' && message.id);
+    if (!prompts.length) return next();
+    let result = await next();
+    if (result.kind !== 'enter') return result;
+    let judged = judgedPrompts.get(agent);
+    if (!judged) judgedPrompts.set(agent, judged = new Set());
     const header = agent.session?.requestHeader?.();
-    const decision = await classifyMessage({ llm: agent.ctx.get('llm'), config: header?.config, message: text, signal: payload.signal });
-    if (decision.action === 'direct') return next();
-    const active = [...records.values()].filter(record => ownerMatches(record, agent) && record.status === 'running').sort((a, b) => b.createdAt - a.createdAt)[0];
-    if (decision.action === 'revise' && active) await cancel(active);
-    const instruction = routerInstruction(decision, { message: text, runId: active?.id, path: active?.path });
-    return { kind: 'enter', messages: [...payload.messages, { role: 'user', content: [{ type: 'text', text: instruction }] }], startsRequestSeries: true };
+    const route = assembledRoutes.get(agent) ?? header?.config ?? agent.options;
+    for (const prompt of prompts) {
+      if (judged.has(prompt.id)) continue;
+      const text = (Array.isArray(prompt.content) ? prompt.content.filter(block => block.type === 'text').map(block => block.text) : [prompt.content]).filter(Boolean).join('\n');
+      if (!text.trim()) continue;
+      // The pre-step hook also runs for tool continuations and retries. Claim each
+      // submitted message before awaiting the classifier, including direct replies.
+      judged.add(prompt.id);
+      const decision = await classifyMessage({ llm: agent.ctx.get('llm'), config: route, message: text, signal: payload.signal });
+      if (decision.action === 'direct') continue;
+      const active = [...records.values()].filter(record => ownerMatches(record, agent) && record.status === 'running').sort((a, b) => b.createdAt - a.createdAt)[0];
+      if (decision.action === 'revise' && active) await cancel(active);
+      const instruction = routerInstruction(decision, { message: text, runId: active?.id, path: active?.path });
+      const routingMessage = Object.freeze({
+        id: randomUUID(), role: 'user', source: Object.freeze({ kind: 'dynamic-workflow' }),
+        content: Object.freeze([Object.freeze({ type: 'text', text: instruction })]),
+      });
+      result = { ...result, messages: [...result.messages, routingMessage] };
+    }
+    return result;
   }));
   ctx.effect(() => () => {
     closed = true;
@@ -143,11 +175,11 @@ export async function apply(ctx, config = {}) {
   });
   ctx.effect(() => ctx.tools.register({
     name: 'dynamic_workflow',
-    description: 'Run a JSON DAG, resume or revise a saved run with a selected model, inspect progress or one node result, list runs or available models, or stop execution. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
+    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, list models, stop execution, or read/update the global workflow setting. Settings writes use the current revision and the same Host persistence as the configuration page. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['run', 'resume', 'revise', 'status', 'stop', 'list', 'models'] },
+        action: { type: 'string', enum: ['run', 'resume', 'revise', 'status', 'stop', 'list', 'models', 'settings'] },
         model: { type: 'string', description: 'For run/resume: executor model override; completed nodes retain their fingerprints. Resume defaults to the saved selection.' },
         provider: { type: 'string', description: 'For run/resume: executor provider override; resume defaults to the saved selection.' },
         workflowPath: { type: 'string', description: 'For run: JSON file readable under the current session filesystem policy; relative paths resolve against its working directory.' },
@@ -155,6 +187,7 @@ export async function apply(ctx, config = {}) {
         nodeId: { type: 'string', description: 'For status: include this node result, truncated at 12000 characters.' },
          revisionReason: { type: 'string', description: 'For revise: the user message or concise reason that caused the workflow change.' },
         concurrency: { type: 'integer', minimum: 1, maximum: 8, description: 'For run/resume: simultaneous nodes, 1–8; run defaults to 1, resume to the saved value.' },
+        globalEnabled: { type: 'boolean', description: 'For settings: optionally set the global workflow switch; omit to read it.' },
       },
     },
     output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
@@ -197,8 +230,24 @@ export async function apply(ctx, config = {}) {
       const owner = exec.agent;
       if (!owner?.ctx || !owner.id) throw new Error('A parent agent is required');
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Arguments must be an object');
-      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider', 'revisionReason'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
+      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider', 'revisionReason', 'globalEnabled'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
       for (const key of ['model', 'provider']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`Invalid ${key}`);
+      if (args.action === 'settings') {
+        const settings = ctx.settings ?? owner.ctx.get('settings');
+        if (!settings) throw new Error('settings is unavailable');
+        const read = () => {
+          const view = settings.describe({ redactSecrets: true }).find(entry => entry.ns === 'dynamic-workflow');
+          if (!view) throw new Error('dynamic-workflow settings namespace not found');
+          return view;
+        };
+        let view = read();
+        if (args.globalEnabled !== undefined) {
+          if (typeof args.globalEnabled !== 'boolean') throw new Error('globalEnabled must be a boolean');
+          await settings.mutate(view.ns, [{ op: 'set', path: ['globalEnabled'], value: args.globalEnabled }], view.revision);
+          view = read();
+        }
+        return { ns: view.ns, globalEnabled: view.value?.globalEnabled === true, revision: view.revision };
+      }
       if (args.action === 'models') {
         const llm = scoped(owner, 'llm');
         return { providers: await Promise.all(llm.listProviders().map(async provider => {
