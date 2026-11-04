@@ -120,7 +120,8 @@ export function continueNodeSession({ ctx, owner, childId, prompt, selection = {
         catch (error) { cleanupError = cleanupError ? new AggregateError([cleanupError, error], 'Child cleanup failed') : error; }
         if (cleanupError) throw cleanupError;
       }
-      if (cancelled || endInfo?.stopReason === 'aborted') return { stopReason: 'cancelled' };
+      if (cancelled) return { stopReason: 'cancelled' };
+      if (endInfo?.stopReason === 'aborted') return { stopReason: 'cancelled', error: `Child session ${childId} stopped: aborted` };
       const text = (endInfo?.lastAssistantMessage || []).filter(block => block.type === 'text').map(block => block.text).join('\n');
       if (endInfo?.stopReason !== 'completed') return { stopReason: 'error', error: text || `Child stopped: ${endInfo?.stopReason || 'unknown'}` };
       if (!validator) return { stopReason: 'completed', value: text };

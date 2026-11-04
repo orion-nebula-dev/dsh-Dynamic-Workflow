@@ -59,6 +59,14 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 
 工作流运行时，卡片定时读取节点状态。显示内容以 Host 返回值为准；读取失败时显示错误。通过命令或助手创建运行后，可以打开面板或点击刷新按钮获取记录。
 
+向正在运行的节点补充说明时，使用 `dynamic_workflow` 的 `message` 操作，或下面的 `/workflow` JSON 命令（无简写形式）。`runId`、`nodeId` 和 `message` 均为必填；消息不能为空，最多 12,000 个字符。先用 `status` 确认节点 ID；工作流中的 `agentId`（例如 `ship`）不是 Team 队友名称，发送消息应使用 `runId` 和 `nodeId`。
+
+```text
+/workflow {"action":"message","runId":"<runId>","nodeId":"<nodeId>","message":"请先核实失败操作的实际状态，再继续处理。"}
+```
+
+消息只会发送给状态为 `running` 的节点当前已有的活跃子 Agent。已完成、待执行或没有活跃子 Agent 的节点会拒绝消息；此操作不会唤醒已完成的 Agent、重启运行或更改模型和角色。返回 `{runId,nodeId,agentSessionId,messageId,accepted:true}` 表示收件箱已接收消息，不代表任务已完成；后续用 `status` 查看进度和结果。
+
 ## 切换模型并继续
 
 选择新模型，再点击「切换模型并继续」。插件先停止旧运行，等待子 Agent 清理完成，再创建继承原运行的新记录。已完成且有效的节点结果会复用；定义未变、身份及指纹验证通过的未完成节点，会恢复原 Agent 会话，并在第一次新请求前应用所选模型。
@@ -145,6 +153,7 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 | `run` | `workflowPath`，可选 `model`、`provider`、`concurrency` | 读取文件并运行，复用有效的既有结果 |
 | `resume` | `runId`，可选 `model`、`provider`、`concurrency` | 停止旧运行并继承保存的定义和进度 |
 | `status` | `runId`，可选 `nodeId` | 查询状态、定义、节点结果和 Agent 诊断 |
+| `message` | `runId`、`nodeId`、`message` | 向正在运行的节点已有的活跃子 Agent 发送消息 |
 | `models` | 无 | 查询当前可用的模型目录 |
 | `stop` | `runId` | 取消执行并等待子 Agent 清理 |
 | `list` | 无 | 查询当前会话的运行历史 |

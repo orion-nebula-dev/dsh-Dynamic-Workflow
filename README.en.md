@@ -59,6 +59,14 @@ When the assistant calls `dynamic_workflow` with `run` or `resume`, the plugin d
 
 While a workflow runs, its card periodically reads node status. Displayed results come from the Host; read failures appear as errors. If the assistant creates a new run, use the refresh button to fetch the latest records.
 
+To send follow-up guidance to a running node, use the `message` action of `dynamic_workflow` or the `/workflow` JSON command below (no shorthand is available). `runId`, `nodeId`, and `message` are required; the message must be nonempty and at most 12,000 characters. Use `status` to confirm the node ID first. A workflow `agentId`, such as `ship`, is not a Team teammate name; address the message with `runId` and `nodeId`.
+
+```text
+/workflow {"action":"message","runId":"<runId>","nodeId":"<nodeId>","message":"Check the actual state of the failed operation before continuing."}
+```
+
+Messages go only to the existing live child Agent of a node whose status is `running`. Completed or pending nodes and nodes without a live child Agent reject messages. This action does not wake completed Agents, restart the run, or change models or roles. The response `{runId,nodeId,agentSessionId,messageId,accepted:true}` means the inbox accepted the message, not that the task is finished. Use `status` afterward to check progress and results.
+
 ## Switch models and continue
 
 Select another model and click **Switch model and continue**. The plugin stops the old run, waits for child Agent cleanup, then creates a new run record that inherits the original progress. It reuses completed node results that are still valid. For unfinished nodes whose definitions are unchanged, it resumes the original Agent session after identity and fingerprint checks pass, applying the selected model before the first new request.
@@ -157,6 +165,7 @@ The tool is named `dynamic_workflow`. The `/workflow` session command invokes th
 | `run` | `workflowPath`; optional `model`, `provider`, `concurrency` | Read the file and run it, reusing valid existing results |
 | `resume` | `runId`; optional `model`, `provider`, `concurrency` | Stop the old run and inherit its saved definition and progress |
 | `status` | `runId`; optional `nodeId` | Inspect status, definition, node results, and Agent diagnostics |
+| `message` | `runId`, `nodeId`, `message` | Send a message to a running node's existing live child Agent |
 | `models` | None | Query the currently available model directory |
 | `stop` | `runId` | Cancel execution and wait for child Agent cleanup |
 | `list` | None | Query the current session's run history |

@@ -166,6 +166,20 @@ test('send failures become result errors and remove installed hooks', async () =
   assert.equal(f.ctx.count() + f.child.ctx.count(), 0);
 });
 
+test('native child interruption preserves its identity and stop reason for node diagnostics', async () => {
+  const f = fixture(); const run = f.run(); await tick();
+  await f.end('earlier assistant output is not a successful result', 'aborted');
+  const result = await run.result;
+  assert.equal(result.stopReason, 'cancelled');
+  assert.equal(result.value, undefined);
+  assert.match(result.error, /persisted-child/);
+  assert.match(result.error, /aborted/);
+  assert.doesNotMatch(result.error, /earlier assistant output/);
+  await run.dispose();
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.ctx.count() + f.child.ctx.count(), 0);
+});
+
 test('model failure is an ordinary result error', async () => {
   const f = fixture(); const run = f.run(); await tick(); await f.end('model failed', 'error');
   assert.equal((await run.result).stopReason, 'error'); await run.dispose();

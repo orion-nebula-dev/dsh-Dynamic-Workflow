@@ -38,7 +38,7 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
   const policyActivations = [];
   function nativeChild(childId) {
     const childListeners = new Map(), policy = {};
-    const child = { id: childId, status: 'idle', ctx: {
+    const child = { id: childId, status: 'running', session: { header: { parentSession: owner.id } }, ctx: {
       effect: fn => fn(), on(name, handler) { childListeners.set(name, handler); return () => childListeners.delete(name); },
       systemPrompt: { section(spec) { policy.prompt = spec.text; return () => { delete policy.prompt; }; } },
       tools: {
@@ -73,9 +73,10 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
       return { childId, messageId: 'initial-message', result, async dispose() { await result; } };
     },
     listChildren: async () => [...catalog.values()],
-    async sendMessage(parent, childId, content) {
+    async sendMessage(parent, childId, content, delivery) {
       assert.equal(parent, owner);
       assert.equal(catalog.get(childId)?.mode, 'continuable');
+      if (live.get(childId)?.status === 'running' && options.onMessage) return options.onMessage({ parent, childId, content, signal: delivery.signal });
       const { child, childListeners, policy } = nativeChild(childId);
       live.set(childId, child);
       await emit('agent/created', { agent: child, source: 'resume' });
@@ -252,6 +253,98 @@ test('one capsule reuses its native Agent for successive stages', async t => {
   assert.equal(f.native.continuations.length, 1);
   assert.equal(result.nodes.plan.agentSessionId, result.nodes.deliver.agentSessionId);
   assert.equal(result.nodes.deliver.agentId, 'writer');
+});
+
+test('message steers the running workflow node without restarting or stopping its Agent', async t => {
+  let release, entered; const work = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; }); const messages = [];
+  const f = await fixture(t, async () => { entered(); await work; return 'shipped'; }, undefined, {
+    native: true, onMessage: async delivery => { messages.push(delivery); return 'steering-message'; },
+  });
+  await f.write({ id: 'steer', nodes: [{ id: 'commit_merge', agentId: 'ship', prompt: 'Ship' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  try {
+    await started;
+    const before = await f.call({ action: 'status', runId: run.runId });
+    const controller = new AbortController();
+    const receipt = await f.call({ action: 'message', runId: run.runId, nodeId: 'commit_merge', message: 'Please report the current blocker.' }, f.owner, controller.signal);
+    assert.deepEqual(receipt, { runId: run.runId, nodeId: 'commit_merge', agentSessionId: before.nodes.commit_merge.agentSessionId, messageId: 'steering-message', accepted: true });
+    assert.equal(messages[0].parent, f.owner);
+    assert.equal(messages[0].childId, receipt.agentSessionId);
+    assert.deepEqual(messages[0].content, [{ type: 'text', text: 'Please report the current blocker.' }]);
+    controller.abort();
+    assert.equal((await f.call({ action: 'status', runId: run.runId })).status, 'running');
+    assert.equal(f.requests.length, 1);
+    assert.equal(f.native.continuations.length, 0);
+  } finally { release(); await finished(f, run.runId); }
+  const result = await f.call({ action: 'status', runId: run.runId, nodeId: 'commit_merge' });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.node.output, 'shipped');
+});
+
+test('message rejects non-running nodes, invalid content, and a different owner without waking children', async t => {
+  let release, entered; const work = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; }); let delivered = 0;
+  const f = await fixture(t, async () => { entered(); await work; return 'done'; }, undefined, {
+    native: true, onMessage: async () => { delivered++; return 'unexpected'; },
+  });
+  await f.write({ id: 'message-boundaries', nodes: [
+    { id: 'a', agentId: 'worker', prompt: 'First' }, { id: 'b', prompt: 'Later', deps: ['a'] },
+  ] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  const args = { action: 'message', runId: run.runId, nodeId: 'a', message: 'Progress?' };
+  try {
+    await started;
+    await assert.rejects(f.call(args, { ...f.owner, id: 'other-owner' }), /Run not found/);
+    await assert.rejects(f.call({ ...args, nodeId: 'b' }), /not running/);
+    await assert.rejects(f.call({ ...args, nodeId: 'unknown' }), /Node not found/);
+    await assert.rejects(f.call({ ...args, nodeId: undefined }), /nodeId is required/);
+    for (const message of ['', '   ', 12, 'x'.repeat(12001)]) await assert.rejects(f.call({ ...args, message }), /message must/);
+    const childId = (await f.call({ action: 'status', runId: run.runId })).nodes.a.agentSessionId;
+    const child = f.native.live.get(childId);
+    child.session.header.parentSession = 'unrelated';
+    await assert.rejects(f.call(args), /live running child/);
+    child.session.header.parentSession = f.owner.id;
+    child.status = 'idle';
+    await assert.rejects(f.call(args), /live running child/);
+    child.status = 'running';
+    f.native.live.delete(childId);
+    await assert.rejects(f.call(args), /live running child/);
+    f.native.live.set(childId, child);
+  } finally { release(); await finished(f, run.runId); }
+  await assert.rejects(f.call(args), /not running/);
+  assert.equal(delivered, 0);
+});
+
+test('message admission is cancelled when its target stage finishes before acceptance', async t => {
+  let release, entered, admitted; const work = new Promise(resolve => { release = resolve; });
+  const started = new Promise(resolve => { entered = resolve; });
+  const admissionStarted = new Promise(resolve => { admitted = resolve; });
+  const caller = new AbortController(); let deliverySignal, rejection;
+  const f = await fixture(t, async () => { entered(); await work; return 'done'; }, undefined, {
+    native: true, onMessage: ({ signal }) => new Promise((resolve, reject) => {
+      deliverySignal = signal;
+      const abort = () => reject(signal.reason);
+      if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
+      admitted();
+    }),
+  });
+  await f.write({ id: 'message-race', nodes: [{ id: 'a', agentId: 'worker', prompt: 'Work' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  try {
+    await started;
+    rejection = assert.rejects(f.call({ action: 'message', runId: run.runId, nodeId: 'a', message: 'Progress?' }, f.owner, caller.signal), /stopped|abort/i);
+    await Promise.race([admissionStarted, rejection.then(() => { throw new Error('Message rejected before admission started'); })]);
+    release();
+    assert.equal((await finished(f, run.runId)).status, 'completed');
+    assert.equal(deliverySignal.aborted, true);
+    await rejection;
+    assert.equal(f.listeners.get('subagent/end').size, 0);
+  } finally {
+    caller.abort(); release();
+    await rejection?.catch(() => {});
+    await finished(f, run.runId);
+  }
 });
 
 test('each stage installs its role prompt and tools before activating the same capsule Agent', async t => {

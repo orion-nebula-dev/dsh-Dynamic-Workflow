@@ -175,16 +175,17 @@ export async function apply(ctx, config = {}) {
   });
   ctx.effect(() => ctx.tools.register({
     name: 'dynamic_workflow',
-    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, list models, stop execution, or read/update the global workflow setting. Settings writes use the current revision and the same Host persistence as the configuration page. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
+    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, message a running node, list models, stop execution, or read/update the global workflow setting. Workflow agentId names are not Team teammate targets; use message to steer the existing child. A message receipt confirms inbox acceptance, not task completion. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['run', 'resume', 'revise', 'status', 'stop', 'list', 'models', 'settings'] },
+        action: { type: 'string', enum: ['run', 'resume', 'revise', 'status', 'stop', 'list', 'models', 'settings', 'message'] },
         model: { type: 'string', description: 'For run/resume: executor model override; completed nodes retain their fingerprints. Resume defaults to the saved selection.' },
         provider: { type: 'string', description: 'For run/resume: executor provider override; resume defaults to the saved selection.' },
         workflowPath: { type: 'string', description: 'For run: JSON file readable under the current session filesystem policy; relative paths resolve against its working directory.' },
-        runId: { type: 'string', description: 'For resume, status or stop: identifier returned by run.' },
-        nodeId: { type: 'string', description: 'For status: include this node result, truncated at 12000 characters.' },
+        runId: { type: 'string', description: 'For resume, revise, status, stop or message: identifier returned by run.' },
+        nodeId: { type: 'string', description: 'For message: required running node id from status. For status: include its result, truncated at 12000 characters.' },
+        message: { type: 'string', minLength: 1, maxLength: LIMIT, description: 'For message: required nonblank text to deliver to the running node.' },
          revisionReason: { type: 'string', description: 'For revise: the user message or concise reason that caused the workflow change.' },
         concurrency: { type: 'integer', minimum: 1, maximum: 8, description: 'For run/resume: simultaneous nodes, 1–8; run defaults to 1, resume to the saved value.' },
         globalEnabled: { type: 'boolean', description: 'For settings: optionally set the global workflow switch; omit to read it.' },
@@ -201,6 +202,7 @@ export async function apply(ctx, config = {}) {
     '/workflow resume <runId> — 继续原工作流',
     '/workflow stop <runId> — 停止运行',
     '/workflow models — 查看可用模型',
+    '/workflow {"action":"message","runId":"<runId>","nodeId":"<nodeId>","message":"进度如何？"} — 向运行中的节点发送消息',
     '高级参数可直接使用 JSON，例如 /workflow {"action":"list"}。',
   ].join('\n');
   if (ctx.commands) for (const name of ['dynamic-workflow', 'workflow']) ctx.effect(() => ctx.commands.register({
@@ -230,7 +232,7 @@ export async function apply(ctx, config = {}) {
       const owner = exec.agent;
       if (!owner?.ctx || !owner.id) throw new Error('A parent agent is required');
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Arguments must be an object');
-      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider', 'revisionReason', 'globalEnabled'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
+      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider', 'revisionReason', 'globalEnabled', 'message'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
       for (const key of ['model', 'provider']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`Invalid ${key}`);
       if (args.action === 'settings') {
         const settings = ctx.settings ?? owner.ctx.get('settings');
@@ -257,6 +259,31 @@ export async function apply(ctx, config = {}) {
       }
       if (args.action === 'restart') throw new Error('Safe restart recovery is unsupported; run again only after reviewing possible side effects');
       if (args.action === 'list') return { runs: [...records.values()].filter(record => ownerMatches(record, owner)).map(record => brief(record)) };
+      if (args.action === 'message') {
+        const record = records.get(args.runId);
+        if (!record || !ownerMatches(record, owner)) throw new Error('Run not found for this owner');
+        if (record.status !== 'running') throw new Error('Run is not running');
+        if (typeof args.nodeId !== 'string' || !args.nodeId.trim()) throw new Error('nodeId is required');
+        const node = record.snapshot?.nodes?.[args.nodeId];
+        if (!node) throw new Error('Node not found');
+        if (node.status !== 'running') throw new Error('Node is not running');
+        if (typeof args.message !== 'string' || !args.message.trim() || args.message.length > LIMIT) throw new Error(`message must be nonblank text of at most ${LIMIT} characters`);
+        const childId = record.nodeSessions?.[args.nodeId]?.childId;
+        const live = childId && owner.ctx.get('agents')?.get(childId);
+        if (!live || live.status !== 'running' || live.session?.header?.parentSession !== owner.id) throw new Error('Node has no live running child; inspect its status before messaging');
+        const subagents = scoped(owner, 'subagents');
+        if (typeof subagents.sendMessage !== 'function' || typeof ctx.on !== 'function') throw new Error('Native child messaging is unavailable');
+        const admission = new AbortController();
+        const off = ctx.on('subagent/end', info => {
+          if (info.id === childId) admission.abort(new Error('Node stopped before message acceptance'));
+        });
+        try {
+          const signal = AbortSignal.any([exec.signal, record.controller.signal, admission.signal].filter(Boolean));
+          signal.throwIfAborted();
+          const messageId = await subagents.sendMessage(owner, childId, [{ type: 'text', text: args.message }], { signal });
+          return { runId: record.id, nodeId: args.nodeId, agentSessionId: childId, messageId, accepted: true };
+        } finally { off(); }
+      }
       if (args.action === 'status' || args.action === 'stop') {
         const record = records.get(args.runId);
         if (!record || !ownerMatches(record, owner)) throw new Error('Run not found for this owner');
