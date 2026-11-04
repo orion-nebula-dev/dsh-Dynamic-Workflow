@@ -183,6 +183,20 @@ test('a capsule retains its Agent after plugin reload and a newly appended stage
   assert.equal(result.nodes.deliver.agentSessionId, original.nodes.plan.agentSessionId);
 });
 
+test('revise stops the source run, reads the new definition, and records the trigger', async t => {
+  const f = await fixture(t, async prompt => prompt);
+  await f.write({ id: 'revision-flow', nodes: [{ id: 'a', prompt: 'old' }] });
+  const first = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  await finished(f, first.runId);
+  await f.write({ id: 'revision-flow', nodes: [{ id: 'a', prompt: 'new' }] });
+  const revised = await f.call({ action: 'revise', runId: first.runId, workflowPath: 'flow.json', revisionReason: 'user changed acceptance criteria' });
+  const result = await finished(f, revised.runId);
+  assert.equal(result.status, 'completed');
+  assert.equal(result.revisionReason, 'user changed acceptance criteria');
+  assert.equal(result.resumedFrom, first.runId);
+  assert.equal(f.requests.at(-1).args.prompt, 'new');
+});
+
 test('changed executed capsule history requires a fresh workflow identity', async t => {
   const f = await fixture(t, async () => 'done', undefined, { native: true });
   const original = { id: 'capsule-version-1', nodes: [{ id: 'a', agentId: 'worker', prompt: 'Original task' }] };

@@ -1,11 +1,14 @@
 import { randomUUID, createHash } from 'node:crypto';
 import { z } from 'zod';
+import schema from '@deepseek-ai/schemastery';
 import { validateWorkflow, runWorkflow } from './core.mjs';
 import { continueNodeSession } from './continuation.mjs';
+import { classifyMessage, isRootAgent, routerInstruction } from './global.mjs';
 
 const memberLabel = (runId, nodeId) => `dw-${runId}-${createHash('sha256').update(nodeId).digest('hex').slice(0, 12)}`;
 
 export const inject = ['tools', 'storageDomain', 'commands'];
+export const Config = schema.object({ globalEnabled: schema.boolean().default(false).description('Classify every human message in root sessions with the current session model before handling it.') });
 const SCRIPT = 'return await agent(args.prompt, args.options);';
 const LIMIT = 12000;
 
@@ -36,7 +39,7 @@ function brief(record, snapshot = record.snapshot, nodeId) {
     title: record.title ?? record.workflow?.title ?? record.workflow?.id ?? record.path,
     createdAt: record.createdAt, concurrency: record.concurrency ?? 1,
     resumeSupported: record.workflow !== undefined };
-  for (const key of ['resumedFrom', 'model', 'provider', 'contextWarning']) if (record[key] !== undefined) result[key] = record[key];
+  for (const key of ['resumedFrom', 'model', 'provider', 'contextWarning', 'revisionReason']) if (record[key] !== undefined) result[key] = record[key];
   if (record.error) result.error = record.error.slice(0, LIMIT);
   if (snapshot) {
     const definitions = new Map((Array.isArray(record.workflow?.nodes) ? record.workflow.nodes : []).map(node => [node.id, node]));
@@ -62,7 +65,7 @@ function brief(record, snapshot = record.snapshot, nodeId) {
 }
 
 /** Host adapter: workflow state lives in the profile storage domain, scoped by Session id. */
-export async function apply(ctx) {
+export async function apply(ctx, config = {}) {
   const runStatus = z.enum(['running', 'completed', 'failed', 'cancelled', 'interrupted', 'needs_review']);
   const snapshotSchema = z.object({
     version: z.literal(1), workflowId: z.string(), runId: z.string(),
@@ -77,7 +80,7 @@ export async function apply(ctx) {
     id: z.string(), ownerId: z.string(), key: z.string(), path: z.string(), status: runStatus,
     createdAt: z.number().int().nonnegative(), snapshot: snapshotSchema.optional(), error: z.string().optional(),
     workflow: z.json().optional(), title: z.string().optional(), resumedFrom: z.string().optional(),
-    model: z.string().optional(), provider: z.string().optional(), concurrency: z.number().int().min(1).max(8).optional(),
+    model: z.string().optional(), provider: z.string().optional(), concurrency: z.number().int().min(1).max(8).optional(), revisionReason: z.string().optional(),
     nodeSessions: z.record(z.string(), z.object({ childId: z.string(), fingerprint: z.string(), continuations: z.number().int().nonnegative().optional() }).strict()).optional(),
     contextWarning: z.string().optional(),
   }).strict();
@@ -92,7 +95,7 @@ export async function apply(ctx) {
   function saveRecord(record) {
     const value = structuredClone({ id: record.id, ownerId: record.owner.id, key: record.key, path: record.path, status: record.status, createdAt: record.createdAt, snapshot: record.snapshot, error: record.error,
       workflow: record.workflow, title: record.title, resumedFrom: record.resumedFrom,
-      model: record.model, provider: record.provider, concurrency: record.concurrency,
+      model: record.model, provider: record.provider, concurrency: record.concurrency, revisionReason: record.revisionReason,
       nodeSessions: record.nodeSessions, contextWarning: record.contextWarning });
     record.pendingSave = (record.pendingSave ?? Promise.resolve()).then(() => runsTable.put(record.id, value));
     return record.pendingSave;
@@ -116,6 +119,19 @@ export async function apply(ctx) {
     for (const handle of record.handles) handle.cancel('Dynamic workflow stopped');
     await record.done;
   }
+  if (config.globalEnabled && typeof ctx.on === 'function') ctx.effect(() => ctx.on('agent/pre-step', async (payload, next) => {
+    const agent = payload?.agent;
+    if (!isRootAgent(agent) || !Array.isArray(payload.messages) || payload.messages.some(message => String(message.content ?? '').includes('[Dynamic Workflow router]'))) return next();
+    const text = payload.messages.flatMap(message => Array.isArray(message.content) ? message.content.filter(block => block.type === 'text').map(block => block.text) : [message.content]).filter(Boolean).join('\\n');
+    if (!text.trim()) return next();
+    const header = agent.session?.requestHeader?.();
+    const decision = await classifyMessage({ llm: agent.ctx.get('llm'), config: header?.config, message: text, signal: payload.signal });
+    if (decision.action === 'direct') return next();
+    const active = [...records.values()].filter(record => ownerMatches(record, agent) && record.status === 'running').sort((a, b) => b.createdAt - a.createdAt)[0];
+    if (decision.action === 'revise' && active) await cancel(active);
+    const instruction = routerInstruction(decision, { message: text, runId: active?.id, path: active?.path });
+    return { kind: 'enter', messages: [...payload.messages, { role: 'user', content: [{ type: 'text', text: instruction }] }], startsRequestSeries: true };
+  }));
   ctx.effect(() => () => {
     closed = true;
     return (async () => {
@@ -127,16 +143,17 @@ export async function apply(ctx) {
   });
   ctx.effect(() => ctx.tools.register({
     name: 'dynamic_workflow',
-    description: 'Run a JSON DAG, resume a saved run with a selected model, inspect progress or one node result, list runs or available models, or stop execution. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
+    description: 'Run a JSON DAG, resume or revise a saved run with a selected model, inspect progress or one node result, list runs or available models, or stop execution. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['action'],
       properties: {
-        action: { type: 'string', enum: ['run', 'resume', 'status', 'stop', 'list', 'models'] },
+        action: { type: 'string', enum: ['run', 'resume', 'revise', 'status', 'stop', 'list', 'models'] },
         model: { type: 'string', description: 'For run/resume: executor model override; completed nodes retain their fingerprints. Resume defaults to the saved selection.' },
         provider: { type: 'string', description: 'For run/resume: executor provider override; resume defaults to the saved selection.' },
         workflowPath: { type: 'string', description: 'For run: JSON file readable under the current session filesystem policy; relative paths resolve against its working directory.' },
         runId: { type: 'string', description: 'For resume, status or stop: identifier returned by run.' },
         nodeId: { type: 'string', description: 'For status: include this node result, truncated at 12000 characters.' },
+         revisionReason: { type: 'string', description: 'For revise: the user message or concise reason that caused the workflow change.' },
         concurrency: { type: 'integer', minimum: 1, maximum: 8, description: 'For run/resume: simultaneous nodes, 1–8; run defaults to 1, resume to the saved value.' },
       },
     },
@@ -166,7 +183,7 @@ export async function apply(ctx) {
         else {
           const [, action, argument] = /^(\S+)(?:\s+([\s\S]+))?$/.exec(input);
           if (action === 'run' && argument) args = { action, workflowPath: argument.replace(/^(['"])([\s\S]*)\1$/, '$2') };
-          else if (['status', 'resume', 'stop'].includes(action) && argument) args = { action, runId: argument };
+          else if (['status', 'resume', 'revise', 'stop'].includes(action) && argument) args = { action, runId: argument };
           else if (['list', 'models'].includes(action) && !argument) args = { action };
           else throw new Error('命令参数不正确。输入 /workflow 查看用法。');
         }
@@ -175,12 +192,12 @@ export async function apply(ctx) {
     },
   }));
   const locks = new Set();
-  async function execute(args, exec, resumeSource) {
+  async function execute(args, exec, resumeSource, revision = false) {
       if (closed) throw new Error('Plugin is unloading');
       const owner = exec.agent;
       if (!owner?.ctx || !owner.id) throw new Error('A parent agent is required');
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('Arguments must be an object');
-      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
+      for (const key of Object.keys(args)) if (!['action', 'workflowPath', 'runId', 'nodeId', 'concurrency', 'model', 'provider', 'revisionReason'].includes(key)) throw new Error(`Unknown parameter: ${key}`);
       for (const key of ['model', 'provider']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`Invalid ${key}`);
       if (args.action === 'models') {
         const llm = scoped(owner, 'llm');
@@ -219,6 +236,18 @@ export async function apply(ctx) {
         }
         return value;
       }
+      if (args.action === 'revise') {
+        const source = records.get(args.runId);
+        if (!source || !ownerMatches(source, owner)) throw new Error('Run not found for this owner');
+        if (!source.workflow) throw new Error('Saved workflow definition is unavailable');
+        if (typeof args.workflowPath !== 'string' || !args.workflowPath.trim()) throw new Error('workflowPath is required for revision');
+        if (locks.has(source.id)) throw new Error('Run revision already in progress');
+        locks.add(source.id);
+        try {
+          if (source.status === 'running') await cancel(source);
+          return await execute({ action: 'run', workflowPath: args.workflowPath, concurrency: args.concurrency ?? source.concurrency ?? 1, model: args.model ?? source.model, provider: args.provider ?? source.provider, revisionReason: args.revisionReason }, exec, source, true);
+        } finally { locks.delete(source.id); }
+      }
       if (args.action === 'resume') {
         const source = records.get(args.runId);
         if (!source || !ownerMatches(source, owner)) throw new Error('Run not found for this owner');
@@ -238,8 +267,8 @@ export async function apply(ctx) {
       const engine = scoped(owner, 'workflowEngine');
       const fs = scoped(owner, 'fs');
       const cwd = await scoped(owner, 'workingDirectory').ensure(owner, exec.signal);
-      const target = resumeSource ? { targetKey: resumeSource.key, displayPath: resumeSource.path } : await fs.resolve(args.workflowPath, { cwd, signal: exec.signal });
-      let loadedWorkflow = resumeSource ? validateWorkflow(resumeSource.workflow) : undefined;
+      const target = resumeSource && !revision ? { targetKey: resumeSource.key, displayPath: resumeSource.path } : await fs.resolve(args.workflowPath, { cwd, signal: exec.signal });
+      let loadedWorkflow = resumeSource && !revision ? validateWorkflow(resumeSource.workflow) : undefined;
       if (!loadedWorkflow) {
         const sourceBytes = typeof fs.readBytes === 'function' ? await fs.readBytes(target, exec.signal, 1024 * 1024 + 1) : new TextEncoder().encode(await fs.readText(target, exec.signal));
         if (sourceBytes.byteLength > 1024 * 1024) throw new Error('Workflow exceeds 1 MiB');
@@ -252,7 +281,7 @@ export async function apply(ctx) {
       if (matching.some(record => record.status === 'running')) throw new Error('Workflow is already running');
       const prior = resumeSource ?? matching.sort((a, b) => a.createdAt - b.createdAt).at(-1);
       const createdAt = Math.max(Date.now(), (prior?.createdAt ?? 0) + 1);
-      const record = { id: randomUUID(), owner, ownerId: owner.id, key: target.targetKey, path: target.displayPath, createdAt, workflow: loadedWorkflow, title: typeof loadedWorkflow.title === 'string' ? loadedWorkflow.title : loadedWorkflow.id, resumedFrom: resumeSource?.id, model: args.model, provider: args.provider, concurrency, status: 'running', nodeSessions: structuredClone(prior?.workflow?.id === loadedWorkflow.id ? prior.nodeSessions ?? {} : {}), handles: new Set(), controller: new AbortController() };
+      const record = { id: randomUUID(), owner, ownerId: owner.id, key: target.targetKey, path: target.displayPath, createdAt, workflow: loadedWorkflow, title: typeof loadedWorkflow.title === 'string' ? loadedWorkflow.title : loadedWorkflow.id, resumedFrom: resumeSource?.id, revisionReason: typeof args.revisionReason === 'string' ? args.revisionReason.slice(0, LIMIT) : undefined, model: args.model, provider: args.provider, concurrency, status: 'running', nodeSessions: structuredClone(prior?.workflow?.id === loadedWorkflow.id ? prior.nodeSessions ?? {} : {}), handles: new Set(), controller: new AbortController() };
       // Reserve synchronously before any persistence await; aliases share targetKey.
       records.set(record.id, record);
       const abort = () => { record.controller.abort(); for (const handle of record.handles) handle.cancel('Parent call cancelled'); };

@@ -25,6 +25,7 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 | `/workflow list` | 查看当前会话的运行记录和 `runId` |
 | `/workflow status <runId>` | 查看阶段进度和节点状态 |
 | `/workflow resume <runId>` | 使用保存的定义和进度继续执行 |
+| `/workflow revise <JSON>` | 停止旧运行，读取新定义并按条件复用结果 |
 | `/workflow stop <runId>` | 停止运行并等待子 Agent 清理 |
 | `/workflow models` | 查看可用模型的 `provider` 和 `model` 标识 |
 
@@ -69,6 +70,12 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 原会话验证通过后，未完成节点可以在同一会话内继续，无须将节点标为 `retrySafe`。续聊提示要求 Agent 先核实中断操作的实际状态，避免重复执行；历史恢复不能保证外部操作恰好执行一次。
 
 如果旧记录没有保存 Agent 身份，只能保留有效的完成结果，未完成节点按原有重试和审核规则处理：可能重复产生影响的中断节点标为 `needs_review`；确认允许重复执行后，才设置 `retrySafe: true`。只读示例已设置这个选项。已经保存身份但无法找到原会话时，插件会报错，不会自动创建新 Agent 替代；身份或指纹不匹配也不会绕过审核。
+
+## 全局自动工作流
+
+插件配置中的「全局自动工作流」默认关闭。打开后，每条主会话用户消息都会先由当前会话模型进行一次轻量判断：普通消息直接交给主会话；多步骤任务会提示主会话创建工作流；已有工作流运行时，改变目标或约束的消息会先停止并等待子 Agent 清理，再提示主会话修订工作流。子 Agent 和工具返回不会再次触发这层判断。
+
+自动判断会增加一次模型请求。插件只负责分类、停止和传递修订上下文，工作流定义仍由主会话模型通过 `dynamic_workflow` 创建或修订。修订时应保持兼容节点的 `id` 和工作流 `id`，以便校验并复用有效结果；阶段角色提示词和 tools 会在每次阶段激活前重新应用。若历史或指纹不兼容，插件不会静默替换 Agent，主会话需要说明触发消息和不可复用原因。
 
 ## 修改任务
 

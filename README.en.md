@@ -25,6 +25,7 @@ Enter commands in the session input box. `/workflow` alone shows command help; i
 | `/workflow list` | List runs in the current session |
 | `/workflow status <runId>` | Inspect a run's status |
 | `/workflow resume <runId>` | Continue from the saved definition and progress |
+| `/workflow revise <JSON>` | Stop the old run, load a new definition, and reuse compatible results |
 | `/workflow stop <runId>` | Cancel execution and wait for child Agent cleanup |
 | `/workflow models` | List currently available executor models |
 
@@ -71,6 +72,12 @@ Once the original session passes validation, unfinished nodes can continue in th
 For older records without a saved Agent identity, only valid completed results can be retained. Unfinished nodes follow the existing retry and review rules: interrupted nodes whose effects could be repeated become `needs_review`. Set `retrySafe: true` only after confirming that repeating the operation is acceptable. The bundled read-only example already sets this option.
 
 If a record has a saved identity but the original Agent session cannot be found, the plugin reports an error instead of creating a replacement Agent. Identity or fingerprint mismatches also do not bypass review.
+
+## Global automatic workflow mode
+
+Global automatic workflow mode is off by default in plugin configuration. When enabled, every human message in a root session receives a lightweight classification from the current session model before the assistant proceeds. Ordinary messages continue directly; multi-step tasks receive an instruction to create a workflow; requirement changes first stop and drain the active run before the assistant revises it. Child Agents and tool results do not trigger this classifier again.
+
+This adds one model request per human message. The plugin classifies, stops, and supplies revision context; the parent model still creates or revises the JSON workflow through `dynamic_workflow`. Keep compatible node IDs and the workflow ID when revising so completed results can be fingerprint-checked and reused. Stage role prompts and tool permissions are reapplied before each stage activation. If Agent history or fingerprints are incompatible, the plugin does not silently replace the Agent; the parent should report the triggering message and why the stage cannot be reused.
 
 ## Change a task
 

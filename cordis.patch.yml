@@ -4,4 +4,5 @@
 - insert:
     - id: dynamic-workflow
       name: '@local/dynamic-workflow'
-      config: {}
+      config:
+        globalEnabled: false
