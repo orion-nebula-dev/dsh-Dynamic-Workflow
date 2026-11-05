@@ -138,11 +138,52 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 }
 ```
 
-`tools` 是允许调用的 Harness 工具名称列表，工具必须在当前组合中可用。`[]` 禁止本阶段所有工具调用；省略则沿用可用工具。节点的 `tools` 可以覆盖角色的列表。策略会同时限制继承的工具和实际调用，不能借工具封装通道绕过；子 Agent 自己注册的工具可能仍出现在目录中，但未获允许时无法执行。显式工具策略使用原生工具展示。角色不会修改父会话的工具权限。
+`tools` 是允许调用的 Harness 工具名称列表，工具必须在当前组合中可用。`[]` 禁止本阶段所有工具调用；省略则沿用可用工具。节点的 `tools` 可以覆盖角色的列表。策略会同时限制继承的工具和实际调用，不能借工具封装通道绕过；子 Agent 自己注册的工具可能仍出现在目录中，但未获允许时无法执行。工具调用使用当前 Host 配置的工具执行器。角色不会修改父会话的工具权限。
 
 附带示例使用两个胶囊代理：方案代理在第一阶段担任方案设计师，在第三阶段切换为交付编写者；评审代理独立执行第二阶段。三阶段对应两个 Agent 会话。
 
 没有 `agentId` 的旧节点保持各自独立的 Agent 会话。`agentTitle` 只用于旧式显示名称；同名标签不会自动合并身份。新配置应显式填写 `agentId` 和 `role`。
+
+## 有界审查与修复
+
+在 `nodes` 中使用 `reviewLoop`，让独立 Agent 审查产物，并在需要修改时交回开发 Agent：
+
+```json
+{
+  "id": "quality",
+  "deps": ["implement"],
+  "reviewLoop": {
+    "maxRounds": 3,
+    "review": { "agentId": "reviewer", "role": "review", "prompt": "检查产物是否满足验收规则。满足则 approved，否则给出可核实的问题。" },
+    "fix": { "agentId": "developer", "role": "fix", "prompt": "根据 findings 修订产物，返回完整修订稿。" }
+  }
+}
+```
+
+`agents` 和 `roles` 仍在顶级定义。`review` 与 `fix` 必须使用不同的 `agentId`；`fix` 可以复用 `implement` 的 `developer`，保留其会话历史。审查与开发使用不同会话，但共享工作区；这不提供文件隔离，也不保证 Bash 只读。
+
+- `maxRounds` 默认是 3，必须是 1 至 50 的安全整数，次数包含初审。3 轮最多执行 `review1 → fix1 → review2 → fix2 → review3`；设为 1 时只审查，不修复。
+- 任一轮返回 `approved` 后，剩余轮次显示为跳过。末轮仍为 `changes-required` 时，`quality` 门禁失败，依赖 `quality` 的 `deliver` 不执行。
+- `review` 和 `fix` 是节点模板，不能包含 `id`、`deps` 或嵌套 `reviewLoop`。审查的输出 `schema` 由运行时提供，不能覆盖。
+
+审查必须返回 JSON，例如：
+
+```json
+{
+  "verdict": "changes-required",
+  "findings": [{ "message": "缺少验证说明", "evidence": "产物只有目标和操作两行，没有验证行。" }]
+}
+```
+
+`verdict` 只能是 `approved` 或 `changes-required`。通过时 `findings` 必须为空数组；不通过时至少有一条，每条必须包含 `message` 和可核实的 `evidence`。可以添加其他属性。格式不合法属于执行失败，不会自动进入修复。产物满足规则就应通过，无须每轮制造问题。
+
+Host 在运行前静态展开为 `${id}/review/1`、`${id}/fix/1` 等内部节点；展开后的总节点数仍不得超过 100。每轮独立持久化，支持断点继续。原 `quality` ID 保留为下游依赖的汇总门禁，成功时 `output` 是最终审查报告。
+
+[文本审查示例](workflow.review-loop.example.json) 的所有角色均设置 `tools: []`，不写文件。初稿故意缺少验证行；审查按明确规则输出 findings，开发 Agent 修订后再审查，通过后才交付。可手动运行真实模型检查流程：
+
+```text
+/workflow run dynamic-workflow/workflow.review-loop.example.json
+```
 
 ## 助手工具
 
@@ -166,6 +207,6 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 
 `status` 指定 `nodeId` 时，`agent` 返回对应会话最新实际请求的模型，而非仅返回工作流选择值。Agent 仍在运行时还包含有长度上限的最近助手消息。历史运行与后续运行可以引用同一 Agent，因此这里反映该会话的最新请求；读取持久化诊断不会激活 Agent。
 
-工作流文件最多 1 MiB、100 个节点。节点详情会截断较长的展示内容。缓存根据工作流定义和依赖结果判断是否有效；任务依赖的外部资料变化时，应由助手更新相应输入，避免复用过期结果。
+工作流文件最多 1 MiB，Host 展开后最多 100 个节点。节点详情会截断较长的展示内容。缓存根据工作流定义和依赖结果判断是否有效；任务依赖的外部资料变化时，应由助手更新相应输入，避免复用过期结果。
 
 阶段按节点展示；依赖关系包含节点的 `deps` 和共享代理的隐式前置阶段。每次激活会重新安装阶段角色与工具策略，重启后也会在原 Agent 会话恢复前安装。

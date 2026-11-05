@@ -413,6 +413,170 @@ test('earlier same-agent input and role changes invalidate later cached history'
   }
 });
 
+test('expands reviewLoop into bounded review fix gate nodes with fixed schema', () => {
+  const workflow = { id: 'review-expand', agents: { dev: {}, rev: {} }, roles: { review: { prompt: 'review' }, fix: { prompt: 'fix' } }, nodes: [
+    { id: 'quality', deps: ['input'], agentId: 'dev', reviewLoop: {
+      review: { agentId: 'rev', role: 'review', prompt: 'Check ${input}' },
+      fix: { agentId: 'dev', role: 'fix', prompt: 'Fix ${findings}' },
+    } },
+    { id: 'input' },
+  ] };
+  const result = core.validateWorkflow(workflow);
+  assert.deepEqual(result.nodes.map(node => node.id), ['quality/review/1', 'quality/fix/1', 'quality/review/2', 'quality/fix/2', 'quality/review/3', 'quality', 'input']);
+  assert.deepEqual(result.nodes.find(node => node.id === 'quality/review/1').deps, ['input']);
+  assert.deepEqual(result.nodes.find(node => node.id === 'quality/fix/1').deps, ['input', 'quality/review/1']);
+  assert.deepEqual(result.nodes.find(node => node.id === 'quality/review/2').deps, ['quality/fix/1', 'quality/review/1']);
+  assert.deepEqual(result.nodes.find(node => node.id === 'quality').deps, ['quality/review/3']);
+  assert.equal(result.nodes.find(node => node.id === 'quality/review/1').reviewStep.kind, 'review');
+  assert.deepEqual(core.validateWorkflow(result), result);
+  assert.deepEqual(result.nodes.find(node => node.id === 'quality/review/1').schema, {
+    type: 'object', description: 'approved requires empty findings; changes-required requires non-empty findings; evidence must be verifiable.', properties: { verdict: { enum: ['approved', 'changes-required'] }, findings: { type: 'array', items: { type: 'object', properties: { message: { type: 'string' }, evidence: { type: 'string' } }, required: ['message', 'evidence'] } } }, required: ['verdict', 'findings'],
+  });
+});
+
+test('rejects reviewLoop invalid bounds and same agent identities', () => {
+  const base = { id: 'invalid-loop', agents: { a: {}, b: {} }, roles: { review: { prompt: 'r' }, fix: { prompt: 'f' } }, nodes: [{ id: 'q', agentId: 'a', reviewLoop: { review: { agentId: 'a', role: 'review', prompt: 'r' }, fix: { agentId: 'a', role: 'fix', prompt: 'f' } } }] };
+  assert.throws(() => core.validateWorkflow(base), /different|agent/i);
+  for (const maxRounds of [0, -1, 1.2, 51]) assert.throws(() => core.validateWorkflow({ ...base, nodes: [{ ...base.nodes[0], reviewLoop: { maxRounds, review: { agentId: 'b', prompt: 'r' }, fix: { agentId: 'a', prompt: 'f' } } }] }), /maxRounds|integer|range/i);
+});
+
+test('passes original dependencies to a fresh fixer alongside review findings', async () => {
+  const { statePath } = await fixture();
+  const workflow = { id: 'fresh-fixer', agents: { impl: {}, rev: {}, fix: {} }, roles: { review: { prompt: 'review' }, fix: { prompt: 'fix' } }, nodes: [{ id: 'implement', input: 'draft' }, { id: 'quality', deps: ['implement'], reviewLoop: { maxRounds: 2, review: { agentId: 'rev', role: 'review', prompt: 'r' }, fix: { agentId: 'fix', role: 'fix', prompt: 'f' } } }] };
+  let fixerDeps;
+  await core.runWorkflow({ workflow, statePath, executor: async (node, { dependencies }) => {
+    if (node.reviewStep?.kind === 'fix') { fixerDeps = dependencies; return 'fixed'; }
+    if (node.reviewStep?.kind === 'review') return { verdict: node.reviewStep.round === 1 ? 'changes-required' : 'approved', findings: node.reviewStep.round === 1 ? [{ message: 'm', evidence: 'e' }] : [] };
+    return node.id === 'implement' ? node.input : 1;
+  } });
+  assert.equal(fixerDeps.implement, 'draft');
+  assert.deepEqual(fixerDeps['quality/review/1'].findings, [{ message: 'm', evidence: 'e' }]);
+});
+
+test('executes review fix cycles, skips after approval, and fails gate at limit', async () => {
+  const { statePath } = await fixture();
+  const workflow = { id: 'review-run', agents: { dev: {}, rev: {} }, roles: { review: { prompt: 'review' }, fix: { prompt: 'fix' } }, nodes: [{ id: 'quality', reviewLoop: { maxRounds: 2, review: { agentId: 'rev', role: 'review', prompt: 'r' }, fix: { agentId: 'dev', role: 'fix', prompt: 'f' } } }, { id: 'deliver', deps: ['quality'] }] };
+  const calls = [];
+  const approved = await core.runWorkflow({ workflow, statePath, executor: async node => { calls.push(node.id); return node.reviewStep?.kind === 'review' ? { verdict: 'approved', findings: [] } : 1; } });
+  assert.equal(approved.status, 'completed');
+  assert.equal(approved.nodes['quality'].status, 'completed');
+  assert.equal(approved.nodes['quality/fix/1'].skipped, true);
+  assert.equal(approved.nodes['quality/review/2'].skipped, true);
+  assert.deepEqual(calls, ['quality/review/1', 'deliver']);
+  const failFixture = await fixture();
+  const fail = await core.runWorkflow({ workflow: { ...workflow, id: 'review-fail' }, statePath: failFixture.statePath, executor: async node => node.reviewStep?.kind === 'review' ? { verdict: 'changes-required', findings: [{ message: 'x', evidence: 'y' }] } : 1 });
+  assert.equal(fail.status, 'failed');
+  assert.equal(fail.nodes.quality.status, 'failed');
+  assert.match(fail.nodes.quality.error, /limit 2/i);
+  assert.equal(fail.nodes.deliver.status, 'blocked');
+  assert.equal(fail.nodes['quality/fix/1'].status, 'completed');
+});
+
+test('rejects invalid review verdicts and findings', async () => {
+  for (const output of [{ verdict: 'wat', findings: [] }, { verdict: 'approved', findings: [{ message: 'x', evidence: 'y' }] }, { verdict: 'changes-required', findings: [] }]) {
+    const badFixture = await fixture();
+    const result = await core.runWorkflow({ statePath: badFixture.statePath, workflow: { id: `bad-${Math.random()}`, nodes: [{ id: 'q', reviewLoop: { review: { agentId: 'r', role: 'review', prompt: 'r' }, fix: { agentId: 'f', role: 'fix', prompt: 'f' } } }], agents: { r: {}, f: {} }, roles: { review: { prompt: 'r' }, fix: { prompt: 'f' } } }, executor: async () => output });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.nodes['q/review/1'].status, 'failed');
+  }
+});
+
+const reviewWorkflow = (maxRounds = 3) => ({ id: 'review-fixture', nodes: [{ id: 'implement', input: 'draft' }, { id: 'q', deps: ['implement'], reviewLoop: { maxRounds, review: { agentId: 'r', prompt: 'review' }, fix: { agentId: 'f', prompt: 'fix' } } }, { id: 'after', deps: ['q'] }] });
+const approvedReport = { verdict: 'approved', findings: [] };
+const changeReport = { verdict: 'changes-required', findings: [{ message: 'repair', evidence: 'line 1' }] };
+const memoryStorage = () => { let value; return { async load() { return value; }, async save(snapshot) { value = structuredClone(snapshot); } }; };
+
+test('supports round limits one two and three with no final fix', async () => {
+  for (const maxRounds of [1, 2, 3]) {
+    const calls = [];
+    const result = await core.runWorkflow({ workflow: reviewWorkflow(maxRounds), storage: memoryStorage(), executor: async node => { calls.push(node.id); return node.reviewStep?.kind === 'review' ? changeReport : 'done'; } });
+    assert.equal(result.nodes.q.status, 'failed');
+    assert.match(result.nodes.q.error, new RegExp(`limit ${maxRounds}`, 'i'));
+    assert.equal(calls.filter(id => id.includes('/review/')).length, maxRounds);
+    assert.equal(calls.filter(id => id.includes('/fix/')).length, maxRounds - 1);
+    assert.equal(result.nodes.after.status, 'blocked');
+  }
+});
+
+test('normalizes bare and fenced JSON review reports and keeps warning fields', async () => {
+  for (const output of [JSON.stringify(approvedReport), `\u0060\u0060\u0060json\n${JSON.stringify({ ...approvedReport, warnings: ['note'] })}\n\u0060\u0060\u0060`]) {
+    const result = await core.runWorkflow({ workflow: reviewWorkflow(1), storage: memoryStorage(), executor: async node => node.reviewStep?.kind === 'review' ? output : 'done' });
+    assert.equal(result.status, 'completed');
+    assert.equal(result.nodes.q.output.verdict, 'approved');
+    assert.equal(typeof result.nodes['q/review/1'].output, 'object');
+  }
+});
+
+test('reuses stored completed fixes and retries only the failed review then invalidates changed inputs', async () => {
+  const workflow = reviewWorkflow(3), storage = memoryStorage(), firstCalls = [];
+  const first = await core.runWorkflow({ workflow, storage, executor: async node => {
+    firstCalls.push(node.id);
+    if (node.id === 'q/review/2') throw new Error('network unavailable');
+    return node.reviewStep?.kind === 'review' ? changeReport : 'done';
+  } });
+  assert.equal(first.nodes['q/review/2'].status, 'failed');
+  const calls = [];
+  const second = await core.runWorkflow({ workflow: core.validateWorkflow(workflow), storage, executor: async node => { calls.push(node.id); return node.reviewStep?.kind === 'review' ? approvedReport : 'done'; } });
+  assert.deepEqual(calls, ['q/review/2', 'after']);
+  assert.equal(second.nodes['q/fix/1'].reused, true);
+  assert.equal(second.nodes['q/review/3'].skipped, true);
+  calls.length = 0;
+  await core.runWorkflow({ workflow, storage, executor: async () => assert.fail('reused executor') });
+  workflow.nodes[0].input = 'changed';
+  await core.runWorkflow({ workflow, storage, executor: async node => { calls.push(node.id); return node.reviewStep?.kind === 'review' ? approvedReport : 'done'; } });
+  assert.deepEqual(calls, ['implement', 'q/review/1', 'after']);
+});
+
+test('cancellation interrupts current review without starting a fix and resumes completed history', async () => {
+  const workflow = reviewWorkflow(3), storage = memoryStorage(), controller = new AbortController();
+  const result = await core.runWorkflow({ workflow, storage, signal: controller.signal, executor: async node => {
+    if (node.id === 'q/review/2') { controller.abort(); return approvedReport; }
+    return node.reviewStep?.kind === 'review' ? changeReport : 'done';
+  } });
+  assert.equal(result.status, 'interrupted');
+  assert.equal(result.nodes['q/review/2'].status, 'interrupted');
+  assert.equal(result.nodes['q/fix/2'].status, 'pending');
+  const calls = [];
+  await core.runWorkflow({ workflow, storage, resumeNodeIds: ['q/review/2'], executor: async node => { calls.push(node.id); return node.reviewStep?.kind === 'review' ? approvedReport : 'done'; } });
+  assert.deepEqual(calls, ['q/review/2', 'after']);
+});
+
+test('pure gate can recover a running snapshot without manual side effect review', async () => {
+  const workflow = reviewWorkflow(1), storage = memoryStorage();
+  await core.runWorkflow({ workflow, storage, executor: async node => node.reviewStep?.kind === 'review' ? approvedReport : 'done' });
+  const saved = await storage.load(); saved.nodes.q.status = 'running';
+  delete saved.nodes.q.output; delete saved.nodes.q.outputHash;
+  await storage.save(saved);
+  const result = await core.runWorkflow({ workflow, storage, executor: async () => assert.fail('completed executor replayed') });
+  assert.equal(result.status, 'completed');
+  assert.equal(result.nodes.q.status, 'completed');
+  assert.equal(result.nodes.q.skipped, undefined);
+});
+
+test('rejects template structural fields schema overrides and generated ID collisions', () => {
+  for (const field of ['id', 'deps', 'reviewLoop', 'reviewStep', 'schema']) {
+    const workflow = reviewWorkflow(); workflow.nodes[1].reviewLoop.review[field] = field === 'id' ? 'override' : {};
+    assert.throws(() => core.validateWorkflow(workflow), /template field/);
+  }
+  const collision = reviewWorkflow(); collision.nodes.push({ id: 'q/review/2' });
+  assert.throws(() => core.validateWorkflow(collision), /collision/);
+  const missing = reviewWorkflow(); delete missing.nodes[1].reviewLoop.fix.agentId;
+  assert.throws(() => core.validateWorkflow(missing), /template/);
+  const unknown = reviewWorkflow(); unknown.nodes[1].reviewLoop.review.role = 'missing';
+  assert.throws(() => core.validateWorkflow(unknown), /role/);
+  const maximum = core.validateWorkflow(reviewWorkflow(50));
+  assert.equal(maximum.nodes.filter(node => node.reviewStep?.kind === 'review').length, 50);
+});
+
+test('review loop IDs containing fix segments preserve their exact dependency prefix', () => {
+  const id = 'quality/fix/2';
+  const workflow = core.validateWorkflow({ id: 'nested-loop-id', nodes: [{ id, reviewLoop: {
+    review: { agentId: 'reviewer', prompt: 'Check artifact' }, fix: { agentId: 'developer', prompt: 'Repair artifact' },
+  } }] });
+  assert.deepEqual(workflow.nodes.find(node => node.id === `${id}/review/2`).deps, [`${id}/fix/1`, `${id}/review/1`]);
+  assert.deepEqual(core.validateWorkflow(workflow), workflow);
+});
+
 test('rejects overlapping runs against the same state file', async () => {
   const { statePath } = await fixture();
   const entered = deferred(), release = deferred();

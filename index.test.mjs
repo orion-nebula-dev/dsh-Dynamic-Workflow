@@ -84,7 +84,8 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
       policyActivations.push({ childId, prompt: policy.prompt, tools: policy.tools && [...policy.tools] });
       histories.get(childId).push(content[0].text);
       live.delete(childId);
-      await emit('subagent/end', { id: childId, local: true, runId: `continuation-${continuations.length}`, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: JSON.stringify({ model: config.model, seed: histories.get(childId)[0] }) }] });
+      const value = options.executeContinuations ? await execute(content[0].text, config) : { model: config.model, seed: histories.get(childId)[0] };
+      await emit('subagent/end', { id: childId, local: true, runId: `continuation-${continuations.length}`, stopReason: 'completed', lastAssistantMessage: [{ type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value) }] });
       return 'accepted-message';
     },
     interrupt() {}, async drainChildren() {},
@@ -284,6 +285,111 @@ test('one capsule reuses its native Agent for successive stages', async t => {
   assert.equal(f.native.continuations.length, 1);
   assert.equal(result.nodes.plan.agentSessionId, result.nodes.deliver.agentSessionId);
   assert.equal(result.nodes.deliver.agentId, 'writer');
+});
+
+function reviewFlow(maxRounds) {
+  return { id: 'bounded-quality', agents: { developer: { title: 'Developer' }, reviewer: { title: 'Independent reviewer' } }, roles: {
+    build: { prompt: 'Build the artifact', tools: [] }, review: { prompt: 'Check against requirements independently', tools: [] }, fix: { prompt: 'Repair the cited findings', tools: [] },
+  }, nodes: [
+    { id: 'draft', agentId: 'developer', role: 'build', prompt: 'INITIAL_ARTIFACT' },
+    { id: 'quality', deps: ['draft'], reviewLoop: { ...(maxRounds === undefined ? {} : { maxRounds }),
+      review: { agentId: 'reviewer', role: 'review', prompt: 'CHECK_ARTIFACT' }, fix: { agentId: 'developer', role: 'fix', prompt: 'REPAIR_ARTIFACT' },
+    } },
+    { id: 'deliver', agentId: 'developer', role: 'build', prompt: 'DELIVER_ARTIFACT', deps: ['quality'] },
+  ] };
+}
+
+for (const approvalRound of [1, 2]) test(`review loop persists skipped rounds and capsule identities after approval in round ${approvalRound}`, async t => {
+  let reviews = 0, fixes = 0;
+  const f = await fixture(t, async prompt => {
+    if (prompt.includes('CHECK_ARTIFACT')) return ++reviews >= approvalRound
+      ? { verdict: 'approved', findings: [] }
+      : { verdict: 'changes-required', findings: [{ message: 'Missing verification', evidence: 'The draft omits the verification step' }] };
+    if (prompt.includes('REPAIR_ARTIFACT')) { fixes++; assert.match(prompt, /Missing verification/); return 'artifact repaired with verification'; }
+    return 'artifact';
+  }, undefined, { native: true, executeContinuations: true });
+  await f.write(reviewFlow());
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  const result = await finished(f, run.runId);
+  assert.equal(result.status, 'completed', result.error);
+  assert.equal(reviews, approvalRound);
+  assert.equal(fixes, approvalRound - 1);
+  assert.equal(result.nodes['quality/fix/2'].skipped, true);
+  assert.equal(result.nodes['quality/review/3'].skipped, true);
+  assert.equal(result.nodes['quality/review/1'].reviewStep.maxRounds, 3);
+  assert.equal(result.nodes.quality.reviewStep.kind, 'gate');
+  assert.equal(result.nodes.quality.agentSessionId, undefined);
+  assert.notEqual(result.nodes.draft.agentSessionId, result.nodes['quality/review/1'].agentSessionId);
+  assert.equal(result.nodes.draft.agentSessionId, result.nodes.deliver.agentSessionId);
+  if (approvalRound > 1) {
+    assert.equal(result.nodes.draft.agentSessionId, result.nodes['quality/fix/1'].agentSessionId);
+    assert.equal(result.nodes['quality/review/1'].agentSessionId, result.nodes['quality/review/2'].agentSessionId);
+    assert.match(f.native.histories.get(result.nodes['quality/review/1'].agentSessionId).at(-1), /artifact repaired with verification/);
+  }
+  assert.equal(f.requests.length, 2, 'only the developer and reviewer start children');
+  await f.unload(); await f.restart();
+  const saved = await f.call({ action: 'status', runId: run.runId, nodeId: 'quality' });
+  assert.equal(saved.node.output.verdict, 'approved');
+  assert.equal(saved.nodes['quality/fix/2'].skipped, true);
+  const resumed = await f.call({ action: 'resume', runId: run.runId });
+  const reused = await finished(f, resumed.runId);
+  assert.equal(reused.status, 'completed', reused.error);
+  assert.equal(reused.contextWarning, undefined, 'deterministic and skipped nodes require no Agent identity');
+  assert.ok(Object.values(reused.nodes).every(node => node.reused));
+  assert.equal(reviews, approvalRound, 'a completed review must not repeat after restart');
+  assert.equal(fixes, approvalRound - 1);
+});
+
+test('review loop stops at its configured limit and blocks delivery', async t => {
+  let reviews = 0, fixes = 0, deliveries = 0;
+  const f = await fixture(t, async prompt => {
+    if (prompt.includes('CHECK_ARTIFACT')) { reviews++; return { verdict: 'changes-required', findings: [{ message: 'Still missing verification', evidence: 'No verification step in this version' }] }; }
+    if (prompt.includes('REPAIR_ARTIFACT')) fixes++;
+    if (prompt.includes('DELIVER_ARTIFACT')) deliveries++;
+    return 'artifact';
+  }, undefined, { native: true, executeContinuations: true });
+  await f.write(reviewFlow(2));
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  const result = await finished(f, run.runId);
+  assert.equal(result.status, 'failed');
+  assert.match(result.error ?? '', /review.*limit|limit.*review/i);
+  assert.equal(reviews, 2);
+  assert.equal(fixes, 1);
+  assert.equal(deliveries, 0);
+  assert.equal(result.nodes.deliver.status, 'blocked');
+  const gate = await f.call({ action: 'status', runId: run.runId, nodeId: 'quality' });
+  assert.match(gate.node.error, /review.*limit|limit.*review/i);
+  const last = await f.call({ action: 'status', runId: run.runId, nodeId: 'quality/review/2' });
+  assert.equal(last.node.output.findings[0].message, 'Still missing verification');
+  await f.unload(); await f.restart();
+  const resumed = await f.call({ action: 'resume', runId: run.runId });
+  const exhausted = await finished(f, resumed.runId);
+  assert.equal(exhausted.status, 'failed');
+  assert.equal(exhausted.contextWarning, undefined, 'a failed deterministic gate has no missing Agent');
+  assert.equal(exhausted.nodes.deliver.status, 'blocked');
+  assert.equal(reviews, 2, 'resuming an exhausted loop does not reset its review budget');
+  assert.equal(fixes, 1);
+  assert.equal(deliveries, 0);
+});
+
+test('missing historical Agent warnings persist across repeated needs-review resumes without a fingerprint', async t => {
+  const f = await fixture(t, async () => 'original result');
+  await f.write({ id: 'legacy-history', nodes: [{ id: 'work', prompt: 'Potentially effectful task' }] });
+  const initial = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  assert.equal((await finished(f, initial.runId)).status, 'completed');
+  await f.unload();
+  const saved = f.storageDomain.tables.get('runs').get(initial.runId);
+  saved.status = 'interrupted'; saved.snapshot.status = 'interrupted';
+  saved.snapshot.nodes.work = { status: 'interrupted' }; saved.nodeSessions = {};
+  await f.restart();
+  let previous = initial;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const resumed = await f.call({ action: 'resume', runId: previous.runId });
+    previous = await finished(f, resumed.runId);
+    assert.equal(previous.status, 'needs_review');
+    assert.match(previous.contextWarning ?? '', /Historical Agent identity unavailable.*work/);
+  }
+  assert.equal(f.requests.length, 1, 'diagnostic recovery must not replay the historical task');
 });
 
 test('message steers the running workflow node without restarting or stopping its Agent', async t => {

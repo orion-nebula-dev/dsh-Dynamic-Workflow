@@ -285,6 +285,26 @@ for (const detail of [false, true]) test(`${detail ? 'detail' : 'inline'} capsul
   assert.equal(capsules[3].props.disabled, true, 'a node without a created Agent cannot navigate');
 });
 
+for (const detail of [false, true]) test(`approved review loops label skipped rounds and deterministic gates in ${detail ? 'details' : 'cards'}`, async () => {
+  let cursor = 0;
+  const registration = (await fixture({ useState(initial) { return [cursor++ === 0 ? detail : initial, () => {}]; } })).find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'review-run', workflowPath: '/tmp/review.json', status: 'completed', nodes: {
+    'quality/review/1': { status: 'completed', agentId: 'reviewer', agentTitle: 'Reviewer', agentSessionId: 'review-child', reviewStep: { loopId: 'quality', kind: 'review', round: 1, maxRounds: 3 } },
+    'quality/fix/1': { status: 'completed', skipped: true, agentId: 'developer', agentTitle: 'Developer', reviewStep: { loopId: 'quality', kind: 'fix', round: 1, maxRounds: 3 } },
+    quality: { status: 'completed', reviewStep: { loopId: 'quality', kind: 'gate', maxRounds: 3 } },
+  } };
+  const card = registration.component({ t: key => key, ...registration.options.inject('parent-session'), node: { data: { run } } });
+  const rendered = card.type(card.props);
+  const tree = detail ? elements(rendered, item => item.props?.className === 'dwf-panel')[0] : rendered;
+  const capsules = elements(tree, item => item.type === 'button' && item.props.className === 'dwf-agent');
+  assert.equal(capsules.length, 2, 'a deterministic review gate has no Agent capsule');
+  assert.match(capsules[1].props.title, /skipped/);
+  assert.equal(elements(tree, item => item.props?.className === 'dwf-dot skipped').length, 1, 'skipped rounds use a neutral status rather than an execution success indicator');
+  assert.equal(capsules[1].props.disabled, true, 'a skipped fix must not create a child conversation');
+  assert.equal(elements(tree, item => item.props?.className === 'dwf-review-gate').length, 1);
+  assert.equal(elements(tree, item => item.type === 'button' && (detail ? item.props['aria-label'] === 'result · quality' : item.props.className === 'dwf-result-link')).length, 1, 'the gate still exposes its report');
+});
+
 test('inspection results and malformed tool text never create a workflow card', async () => {
   const registration = (await fixture()).find(item => item.options.key === 'dynamic_workflow');
   for (const [action, text] of [['list', '{"runs":[]}'], ['run', 'failed to read workflow file']]) {

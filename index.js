@@ -46,6 +46,8 @@ function brief(record, snapshot = record.snapshot, nodeId) {
     result.nodes = Object.fromEntries(Object.entries(snapshot.nodes || {}).map(([id, node]) => {
       const definition = definitions.get(id), session = record.nodeSessions?.[id];
       return [id, { status: node.status, reused: node.reused === true,
+        ...(node.skipped === true ? { skipped: true } : {}),
+        ...(definition?.reviewStep ? { reviewStep: definition.reviewStep } : {}),
         ...(typeof definition?.title === 'string' ? { title: definition.title } : {}),
         ...(typeof definition?.agentTitle === 'string' ? { agentTitle: definition.agentTitle } : {}),
         ...(typeof definition?.agentId === 'string' ? { agentId: definition.agentId } : {}),
@@ -54,6 +56,8 @@ function brief(record, snapshot = record.snapshot, nodeId) {
         ...(Array.isArray(definition?.deps) ? { deps: definition.deps } : {}),
         ...(session ? { agentSessionId: session.childId, continuations: session.continuations ?? 0 } : {}) }];
     }));
+    const failedGate = Object.entries(snapshot.nodes || {}).find(([id, node]) => definitions.get(id)?.reviewStep?.kind === 'gate' && node.status === 'failed');
+    if (!result.error && failedGate?.[1].error) result.error = failedGate[1].error.slice(0, LIMIT);
     if (nodeId !== undefined) {
       if (!snapshot.nodes || !Object.hasOwn(snapshot.nodes, nodeId)) throw new Error('Node not found');
       const node = snapshot.nodes[nodeId];
@@ -72,7 +76,7 @@ export async function apply(ctx, config = {}) {
     status: runStatus,
     nodes: z.record(z.string(), z.object({
       status: z.enum(['pending', 'running', 'completed', 'failed', 'interrupted', 'blocked', 'needs_review']),
-      fingerprint: z.string().optional(), reused: z.boolean().optional(), output: z.json().optional(),
+      fingerprint: z.string().optional(), reused: z.boolean().optional(), skipped: z.boolean().optional(), output: z.json().optional(),
       outputHash: z.string().optional(), error: z.string().optional(),
     }).strict()),
   }).strict();
@@ -175,7 +179,7 @@ export async function apply(ctx, config = {}) {
   });
   ctx.effect(() => ctx.tools.register({
     name: 'dynamic_workflow',
-    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, message a running node, list models, stop execution, or read/update the global workflow setting. Workflow agentId names are not Team teammate targets; use message to steer the existing child. A message receipt confirms inbox acceptance, not task completion. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent.',
+    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, message a running node, list models, stop execution, or read/update the global workflow setting. Workflow agentId names are not Team teammate targets; use message to steer the existing child. A message receipt confirms inbox acceptance, not task completion. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent. A node may define reviewLoop:{review:{agentId,prompt,role?},fix:{agentId,prompt,role?},maxRounds:3}. Distinct review/fix Agents run at most maxRounds reviews including the initial review (default 3, range 1–50). Reviews return {verdict:"approved"|"changes-required",findings:[{message,evidence}]}; approval requires empty findings, rejection requires findings. Approval skips unused rounds; exhaustion fails the original node and blocks its dependents.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['action'],
       properties: {
@@ -415,7 +419,9 @@ export async function apply(ctx, config = {}) {
             }
           }
           if (resumeSource) {
-            const missing = loadedWorkflow.nodes.filter(node => prior.snapshot?.nodes?.[node.id]?.status !== 'completed' && !record.nodeSessions[node.id]);
+            const missing = loadedWorkflow.nodes.filter(node => node.reviewStep?.kind !== 'gate'
+              && ['running', 'interrupted', 'needs_review', 'failed'].includes(prior.snapshot?.nodes?.[node.id]?.status)
+              && !record.nodeSessions[node.id]);
             if (missing.length) record.contextWarning = `Historical Agent identity unavailable for nodes: ${missing.map(node => node.id).join(', ')}. Normal retry/review rules apply.`;
           }
           await saveRecord(record);

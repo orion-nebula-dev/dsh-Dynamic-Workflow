@@ -34,6 +34,7 @@ async function persist(path, state) {
 
 const nonempty = value => typeof value === 'string' && !!value.trim();
 const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const REVIEW_SCHEMA = { type: 'object', description: 'approved requires empty findings; changes-required requires non-empty findings; evidence must be verifiable.', properties: { verdict: { enum: ['approved', 'changes-required'] }, findings: { type: 'array', items: { type: 'object', properties: { message: { type: 'string' }, evidence: { type: 'string' } }, required: ['message', 'evidence'] } } }, required: ['verdict', 'findings'] };
 function validateTools(tools, label) {
   if (!Array.isArray(tools) || tools.some(tool => !nonempty(tool)) || new Set(tools).size !== tools.length) {
     throw new TypeError(`Invalid tools for ${label}: expected unique nonempty names`);
@@ -62,6 +63,41 @@ export function validateWorkflow(definition) {
     }
   }
   const nodes = new Map();
+  const sourceNodes = workflow.nodes;
+  const loopIds = new Set(sourceNodes.filter(node => node && object(node) && Object.hasOwn(node, 'reviewLoop')).map(node => node.id));
+  const expanded = [];
+  for (const source of sourceNodes) {
+    if (!source || !object(source) || !Object.hasOwn(source, 'reviewLoop')) { expanded.push(source); continue; }
+    const loop = source.reviewLoop;
+    if (!object(loop)) throw new TypeError(`Invalid reviewLoop for ${source.id}`);
+    const maxRounds = loop.maxRounds === undefined ? 3 : loop.maxRounds;
+    if (!Number.isSafeInteger(maxRounds) || maxRounds < 1 || maxRounds > 50) throw new TypeError(`Invalid maxRounds for ${source.id}`);
+    for (const kind of ['review', 'fix']) {
+      const template = loop[kind];
+      if (!object(template) || !nonempty(template.agentId) || !nonempty(template.prompt) || (Object.hasOwn(template, 'role') && !nonempty(template.role))) throw new TypeError(`Invalid ${kind} template for ${source.id}`);
+      const forbidden = ['id', 'deps', 'reviewLoop', 'reviewStep', ...(kind === 'review' ? ['schema'] : [])];
+      for (const field of forbidden) if (Object.hasOwn(template, field)) throw new TypeError(`Invalid ${kind} template field: ${field}`);
+    }
+    if (loop.review.agentId === loop.fix.agentId) throw new TypeError(`review and fix agents must be different for ${source.id}`);
+    const reviewIds = [];
+    let previousReview;
+    for (let round = 1; round <= maxRounds; round++) {
+      const reviewId = `${source.id}/review/${round}`;
+      const fixId = `${source.id}/fix/${round}`;
+      if (loopIds.has(reviewId) || loopIds.has(fixId) || sourceNodes.some(node => node?.id === reviewId || node?.id === fixId)) throw new TypeError(`Generated node ID collision: ${reviewId}`);
+      const review = { ...loop.review, id: reviewId, deps: round === 1 ? [...(source.deps ?? [])] : [`${source.id}/fix/${round - 1}`, previousReview], schema: copy(REVIEW_SCHEMA), reviewStep: { loopId: source.id, kind: 'review', round, maxRounds, ...(previousReview ? { previousReview } : {}) } };
+      expanded.push(review);
+      reviewIds.push(reviewId); previousReview = reviewId;
+      if (round < maxRounds) {
+        const fix = { ...loop.fix, id: fixId, deps: [...new Set([...(source.deps ?? []), reviewId])], reviewStep: { loopId: source.id, kind: 'fix', round, maxRounds, previousReview: reviewId } };
+        expanded.push(fix);
+      }
+    }
+    const gate = { ...source, deps: [reviewIds.at(-1)], reviewLoop: undefined, reviewStep: { loopId: source.id, kind: 'gate', round: maxRounds, maxRounds, reviewNodeId: reviewIds.at(-1) }, retrySafe: true, prompt: `Review gate for ${source.id}` };
+    delete gate.reviewLoop; delete gate.agentId; delete gate.agentTitle; delete gate.role; delete gate.rolePrompt; delete gate.roleTitle; delete gate.tools;
+    expanded.push(gate);
+  }
+  workflow.nodes = expanded;
   for (const node of workflow.nodes) {
     if (!node || typeof node.id !== 'string' || !node.id.trim() || nodes.has(node.id)) {
       throw new TypeError('Node IDs must be nonempty and unique');
@@ -107,6 +143,22 @@ export function validateWorkflow(definition) {
     preceding.set(node.agentId, node.id);
   }
   return workflow;
+}
+
+function reviewReport(value) {
+  let report = value;
+  if (typeof report === 'string') {
+    try {
+      const fenced = report.match(/^\s*```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i);
+      report = JSON.parse(fenced ? fenced[1] : report.trim());
+    }
+    catch { throw new Error('Invalid review result: expected JSON object'); }
+  }
+  if (!object(report) || !['approved', 'changes-required'].includes(report.verdict) || !Array.isArray(report.findings)) throw new Error('Invalid review result: verdict and findings are required');
+  if (report.findings.some(item => !object(item) || !nonempty(item.message) || !nonempty(item.evidence))) throw new Error('Invalid review result: findings require message and evidence');
+  if (report.verdict === 'approved' && report.findings.length) throw new Error('Invalid review result: approved review must have empty findings');
+  if (report.verdict === 'changes-required' && !report.findings.length) throw new Error('Invalid review result: changes-required review needs findings');
+  return copy(report);
 }
 
 export async function loadWorkflow(path) {
@@ -197,9 +249,23 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
       state.nodes[id] = { status: 'running', fingerprint, reused: false };
       await save();
       try {
-        const output = copy(await abortable(() => executor(copy(node), { dependencies, fingerprint, runId: state.runId, signal }), signal));
-        if (signal.aborted) throw new Error('Interrupted');
-        state.nodes[id] = { status: 'completed', fingerprint, reused: false, output, outputHash: hash(output) };
+        const step = node.reviewStep;
+        if (step?.kind === 'gate') {
+          const report = copy(dependencies[step.reviewNodeId]);
+          const failed = report?.verdict !== 'approved';
+          state.nodes[id] = { status: failed ? 'failed' : 'completed', fingerprint, reused: false, output: report, outputHash: hash(report), ...(failed ? { error: `Review limit ${step.maxRounds} reached: changes-required` } : {}) };
+        } else {
+          const previousReport = step && step.kind === 'review' ? dependencies[step.previousReview] : step?.kind === 'fix' ? dependencies[step.previousReview] : undefined;
+          if (previousReport?.verdict === 'approved') {
+            const output = copy(previousReport);
+            state.nodes[id] = { status: 'completed', fingerprint, reused: false, skipped: true, output, outputHash: hash(output) };
+          } else {
+            let output = copy(await abortable(() => executor(copy(node), { dependencies, fingerprint, runId: state.runId, signal }), signal));
+            if (signal.aborted) throw new Error('Interrupted');
+            if (step?.kind === 'review') output = reviewReport(output);
+            state.nodes[id] = { status: 'completed', fingerprint, reused: false, output, outputHash: hash(output) };
+          }
+        }
       } catch (error) {
         state.nodes[id] = { status: signal.aborted ? 'interrupted' : 'failed', fingerprint, reused: false, error: String(error?.message ?? error) };
       }

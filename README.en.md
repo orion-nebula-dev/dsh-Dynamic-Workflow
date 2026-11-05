@@ -150,11 +150,52 @@ Different Agents can run in parallel. Stages belonging to the same Agent execute
 
 `tools` lists allowed Harness tool names, which must be available in the current composition. An empty list (`[]`) disables all tool calls for that stage; omitting it inherits available tools. A node's `tools` overrides the role's list.
 
-The policy restricts both inherited tools and actual calls, including calls through tool wrappers. Tools registered by the child Agent itself may still appear in the directory, but cannot execute unless allowed. Explicit tool policies use native tool presentation. Roles do not change the parent session's tool permissions.
+The policy restricts both inherited tools and actual calls, including calls through tool wrappers. Tools registered by the child Agent itself may still appear in the directory, but cannot execute unless allowed. Tool calls use the executor configured by the current Host. Roles do not change the parent session's tool permissions.
 
 The bundled example uses two capsule Agents: the planning Agent acts as planner in the first stage and switches to writer in the third; an independent review Agent handles the second stage. Its three stages use two Agent sessions.
 
 Legacy nodes without `agentId` retain separate Agent sessions. `agentTitle` only supplies a legacy display name; matching labels do not merge identities. New configurations should explicitly set `agentId` and `role`.
+
+## Bounded review and fix loops
+
+Use `reviewLoop` in `nodes` to have an independent Agent review an artifact and return it to the developer when changes are needed:
+
+```json
+{
+  "id": "quality",
+  "deps": ["implement"],
+  "reviewLoop": {
+    "maxRounds": 3,
+    "review": { "agentId": "reviewer", "role": "review", "prompt": "Check the artifact against the acceptance rules. Approve if satisfied; otherwise report verifiable issues." },
+    "fix": { "agentId": "developer", "role": "fix", "prompt": "Revise the artifact using the findings and return the complete revised text." }
+  }
+}
+```
+
+Define `agents` and `roles` at the top level as before. `review` and `fix` must use different `agentId` values. The fix stage can reuse the same `developer` as `implement`, retaining its conversation history. Review and development use separate sessions but share the workspace; this provides neither file isolation nor a guarantee that Bash is read-only.
+
+- `maxRounds` defaults to 3 and must be a safe integer from 1 to 50, including the initial review. Three rounds allow at most `review1 → fix1 → review2 → fix2 → review3`. A value of 1 runs only the review, with no fix.
+- An `approved` verdict skips the remaining rounds, which appear as skipped. If the final review still returns `changes-required`, the `quality` gate fails and a `deliver` node depending on `quality` does not run.
+- `review` and `fix` are node templates. They cannot contain `id`, `deps`, or a nested `reviewLoop`. The runtime supplies the review output `schema`; it cannot be overridden.
+
+A review must return JSON, for example:
+
+```json
+{
+  "verdict": "changes-required",
+  "findings": [{ "message": "Missing verification step", "evidence": "The artifact has only goal and action lines, with no verification line." }]
+}
+```
+
+`verdict` must be `approved` or `changes-required`. Approval requires an empty `findings` array. A rejection requires at least one finding, each with a `message` and verifiable `evidence`. Additional properties are allowed. Invalid output is an execution failure and does not automatically trigger a fix. Approve artifacts that satisfy the rules; do not invent issues to keep the loop running.
+
+Before execution, the Host statically expands the loop into internal nodes such as `${id}/review/1` and `${id}/fix/1`. The expanded workflow is still limited to 100 nodes. Each round is persisted independently for continuation after interruption. The original `quality` ID remains the aggregate gate for downstream dependencies. On success, its `output` is the final review report.
+
+The [text review example](workflow.review-loop.example.json) sets `tools: []` on every role and writes no files. Its initial draft deliberately omits a verification line. The reviewer reports findings against explicit rules, the developer revises the text, and delivery runs only after approval. Run it manually with a real model to check the flow:
+
+```text
+/workflow run dynamic-workflow/workflow.review-loop.example.json
+```
 
 ## Agent tool
 
@@ -178,6 +219,6 @@ Run records, definitions, node snapshots, and their Agent identities are stored 
 
 When `status` includes `nodeId`, its `agent` field reports the model used by that session's latest actual request, rather than only the workflow's selected model. While the Agent is running, it also includes recent assistant messages with a length limit. Historical and later runs can reference the same Agent, so these diagnostics reflect that session's latest request. Reading persisted diagnostics does not activate the Agent.
 
-Workflow files are limited to 1 MiB and 100 nodes. Node details truncate long display content. Cache validity depends on the workflow definition and dependency results. When external material used by a task changes, the assistant should update the relevant inputs to avoid reusing stale results.
+Workflow files are limited to 1 MiB and 100 nodes after Host expansion. Node details truncate long display content. Cache validity depends on the workflow definition and dependency results. When external material used by a task changes, the assistant should update the relevant inputs to avoid reusing stale results.
 
 Stages are displayed by node. Dependencies include both explicit `deps` and implicit preceding stages of a shared Agent. Each activation reinstalls the stage role and tool policy, including before restoring the original Agent session after a restart.

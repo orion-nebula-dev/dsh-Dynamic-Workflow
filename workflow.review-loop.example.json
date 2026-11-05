@@ -1,0 +1,53 @@
+{
+  "id": "bounded-review-text-example",
+  "title": "文本初稿、独立审查与修订",
+  "agents": {
+    "developer": { "title": "开发代理" },
+    "reviewer": { "title": "审查代理" }
+  },
+  "roles": {
+    "draft": { "title": "初稿编写者", "prompt": "只输出任务要求的文本初稿，不添加解释。", "tools": [] },
+    "review": { "title": "独立审查员", "prompt": "独立检查当前待审产物是否满足给定规则。满足全部规则就返回 approved 和空 findings；否则返回 changes-required 和至少一条含 message、evidence 的 findings，evidence 要引用或明确指出产物中的可核实依据。只返回运行时 schema 要求的 JSON，不为延续轮次而制造问题。", "tools": [] },
+    "fix": { "title": "修订者", "prompt": "沿用本 Agent 的产物历史，根据审查 findings 补全或修正产物。只输出完整修订稿，不输出审查报告或解释。", "tools": [] },
+    "deliver": { "title": "交付者", "prompt": "审查门禁通过后，原样交付本 Agent 历史中最近一次完整产物。", "tools": [] }
+  },
+  "nodes": [
+    {
+      "id": "implement",
+      "title": "编写缺少验证行的初稿",
+      "agentId": "developer",
+      "role": "draft",
+      "prompt": "为演示审查修复，初稿只输出以下两行，暂不写验证行：\n目标：发布帮助页\n操作：更新帮助页说明",
+      "retrySafe": true
+    },
+    {
+      "id": "quality",
+      "title": "审查并修订文本",
+      "deps": ["implement"],
+      "reviewLoop": {
+        "maxRounds": 3,
+        "review": {
+          "agentId": "reviewer",
+          "role": "review",
+          "prompt": "检查 Dependencies 中当前待审文本（初审为 implement 初稿，复审为最新修订稿）。验收规则：全文恰好三行，依次为『目标：发布帮助页』『操作：更新帮助页说明』『验证：检查帮助页链接可打开』，不含标题、代码围栏或其他文字。仅按这些文本规则判断，不实际打开链接。全部满足就 approved 且 findings=[]；否则 changes-required，逐项说明不符合之处并给出可核实依据。",
+          "retrySafe": true
+        },
+        "fix": {
+          "agentId": "developer",
+          "role": "fix",
+          "prompt": "根据 Dependencies 中审查报告的 findings 修订最近的产物。验收规则：全文恰好三行，依次为『目标：发布帮助页』『操作：更新帮助页说明』『验证：检查帮助页链接可打开』。只返回完整三行文本，不含标题、代码围栏或其他文字。这里的验证行是计划内容，不声称已实际检查链接。",
+          "retrySafe": true
+        }
+      }
+    },
+    {
+      "id": "deliver",
+      "title": "交付通过审查的文本",
+      "agentId": "developer",
+      "role": "deliver",
+      "deps": ["quality"],
+      "prompt": "quality 已通过。原样输出你在本会话中最近一次编写的完整三行产物，不添加解释。",
+      "retrySafe": true
+    }
+  ]
+}
