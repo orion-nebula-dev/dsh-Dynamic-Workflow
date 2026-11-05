@@ -25,10 +25,12 @@ export function installNodeRole(ctx, agent, role = {}) {
         }));
         if (role.tools !== undefined) {
           const allowed = new Set(role.tools);
-          removers.push(agent.ctx.tools.presentAs('native'));
+          const legacyNative = typeof agent.ctx.tools.presentAs === 'function';
+          if (legacyNative) removers.push(agent.ctx.tools.presentAs('native'));
           removers.push(agent.ctx.tools.restrict({ allow: [...allowed] }));
-          // Inherited masks exempt child-owned tools; enforce the policy at execution too.
-          removers.push(agent.ctx.tools.guard(exec => allowed.has(exec.name) ? undefined : 'Tool is unavailable in this workflow activation'));
+          // New PTC keeps top-level run_code as its transport; only nested calls need the role guard.
+          // Legacy presentAs switches to native execution, so its transport remains denied.
+          removers.push(agent.ctx.tools.guard(exec => ((!legacyNative && exec.name === 'run_code' && exec.parent === undefined) || allowed.has(exec.name)) ? undefined : 'Tool is unavailable in this workflow activation'));
         }
         return cleanup;
       } catch (error) { cleanup(); throw error; }

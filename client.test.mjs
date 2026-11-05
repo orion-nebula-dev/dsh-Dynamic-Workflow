@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
-async function fixture(hooks = {}, remote = {}, globals = {}) {
+async function fixture(hooks = {}, remote = {}, globals = {}, uiWorkspace = { openSession() {} }) {
   let plugin;
   const registrations = [];
   const React = {
@@ -15,7 +15,7 @@ async function fixture(hooks = {}, remote = {}, globals = {}) {
   vm.runInNewContext(source, { AbortController, ...globals, window: { __ModuleLoader__: { load(definition) {
     plugin = definition.factory(name => { assert.equal(name, 'react'); return React; });
   } } } });
-  plugin.apply({ remote, effect: setup => setup(), locale: { register: () => () => {} },
+  plugin.apply({ remote, uiWorkspace, effect: setup => setup(), locale: { register: () => () => {} },
     uiConversation: { events: { register: definition => { registrations.definition = definition; return () => {}; } } }, slots: {
     inject: (_name, setup) => setup(),
     register(options, component) { registrations.push({ options, component }); return () => {}; },
@@ -192,7 +192,7 @@ test('detail and node reads stay quiet while an explicit stop still executes a c
   const cleanup = effects[0]();
   effects[6]();
   await new Promise(resolve => setImmediate(resolve));
-  await elements(tree, item => item.type === 'button' && item.props.className === 'dwf-agent')[0].props.onClick();
+  await elements(tree, item => item.type === 'button' && item.props['aria-label'] === 'result · one')[0].props.onClick();
   assert.deepEqual(queries, [{ action: 'status', runId: 'run-1' }, { action: 'status', runId: 'run-1', nodeId: 'one' }]);
   assert.equal(commands.length, 0);
   await elements(tree, item => item.type === 'button' && item.props.title === 'stop')[0].props.onClick();
@@ -256,6 +256,33 @@ test('capsules expose stable Agent identity while their stage roles change', asy
   assert.equal(name(capsules[0]), 'Planner');
   assert.equal(name(capsules[2]), 'Writer');
   assert.equal(capsules[0].props.children[0].props.className, capsules[2].props.children[0].props.className);
+});
+
+for (const detail of [false, true]) test(`${detail ? 'detail' : 'inline'} capsules open their exact subagent conversation`, async () => {
+  const opened = []; let cursor = 0;
+  const registrations = await fixture({ useState(initial) { return [cursor++ === 0 ? detail : initial, () => {}]; } }, {}, {}, { openSession(target) { opened.push(target); } });
+  const registration = registrations.find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'navigation-run', status: 'running', nodes: {
+    plan: { status: 'completed', agentId: 'worker', agentSessionId: 'child-worker' },
+    deliver: { status: 'running', agentId: 'worker', agentSessionId: 'child-worker' },
+    failed: { status: 'failed', agentId: 'reviewer', agentSessionId: 'child-reviewer' },
+    pending: { status: 'pending', agentId: 'waiting' },
+  } };
+  const component = registration.component({ t: key => key, ...registration.options.inject('parent-session'), node: { data: { run } } });
+  const tree = component.type(component.props);
+  const area = elements(tree, item => item.props.className === (detail ? 'dwf-timeline' : 'dwf-stages'))[0];
+  const capsules = elements(area, item => item.props.className === 'dwf-agent');
+  assert.equal(capsules.length, 4);
+  for (const capsule of capsules.slice(0, 3)) {
+    assert.equal(capsule.type, 'button', 'capsules must support keyboard activation');
+    assert.equal(capsule.props.disabled, false);
+    capsule.props.onClick();
+  }
+  assert.equal(opened.length, 3);
+  assert.deepEqual({ ...opened[0] }, { parentSessionId: 'parent-session', childSessionId: 'child-worker', mode: 'unknown' });
+  assert.deepEqual(opened[0], opened[1], 'serial stages in one capsule open the same Agent');
+  assert.deepEqual({ ...opened[2] }, { parentSessionId: 'parent-session', childSessionId: 'child-reviewer', mode: 'unknown' });
+  assert.equal(capsules[3].props.disabled, true, 'a node without a created Agent cannot navigate');
 });
 
 test('inspection results and malformed tool text never create a workflow card', async () => {

@@ -44,7 +44,6 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
       tools: {
         restrict(spec) { policy.tools = [...spec.allow]; return () => { delete policy.tools; }; },
         guard(handler) { policy.guard = handler; return () => { delete policy.guard; }; },
-        presentAs() { return () => {}; },
       },
     } };
     return { child, childListeners, policy };

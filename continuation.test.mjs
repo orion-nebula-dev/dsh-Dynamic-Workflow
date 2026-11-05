@@ -17,7 +17,6 @@ function bus() {
     },
     presentation() { return presentation; },
     tools: {
-      presentAs(mode) { const previous = presentation; presentation = mode; return () => { presentation = previous; }; },
       restrict(filter) {
         assert.ok(Array.isArray(filter.allow));
         for (const name of filter.allow) if (!names.includes(name)) throw new Error(`unknown tool ${name}`);
@@ -28,7 +27,7 @@ function bus() {
     },
     roleText() { return [...sections.values()].map(section => section.text); },
     availableTools() { return names.filter(name => [...restrictions].every(filter => filter.allow.includes(name))); },
-    denied(name) { return [...guards].some(guard => guard({ name }) !== undefined); },
+    denied(name, parent) { return [...guards].some(guard => guard({ name, parent }) !== undefined); },
     registrations() { return sections.size + restrictions.size + guards.size; },
     on(name, fn) { const set = listeners.get(name) || new Set(); listeners.set(name, set); set.add(fn); return () => set.delete(fn); },
     effect(fn) {
@@ -185,13 +184,29 @@ test('model failure is an ordinary result error', async () => {
   assert.equal((await run.result).stopReason, 'error'); await run.dispose();
 });
 
-test('an explicit stage tool policy uses native tools instead of an inaccessible PTC transport', () => {
+test('an explicit stage tool policy preserves the configured executor while scoping registry tools', () => {
   const f = fixture();
   const off = installNodeRole(f.ctx, f.child, { tools: ['read'] });
-  assert.equal(f.child.ctx.presentation(), 'native');
+  assert.equal(f.child.ctx.presentation(), 'ptc');
+  assert.deepEqual(f.child.ctx.availableTools(), ['read']);
   assert.equal(f.ctx.presentation(), 'ptc');
   off();
   assert.equal(f.child.ctx.presentation(), 'ptc');
+});
+
+test('legacy presentation switches to native and restores without allowing the PTC transport', () => {
+  const f = fixture(); let presentation = 'ptc';
+  f.child.ctx.tools.presentAs = mode => {
+    const previous = presentation; presentation = mode;
+    return () => { presentation = previous; };
+  };
+  const off = installNodeRole(f.ctx, f.child, { tools: ['read'] });
+  assert.equal(presentation, 'native');
+  assert.deepEqual(f.child.ctx.availableTools(), ['read']);
+  assert.equal(f.child.ctx.denied('run_code'), true);
+  off();
+  assert.equal(presentation, 'ptc');
+  assert.equal(f.child.ctx.registrations(), 0);
 });
 
 test('role helper replaces the active system section and old disposers cannot clear the new phase', () => {
@@ -219,6 +234,9 @@ for (const [label, role, expected] of [
   assert.deepEqual(f.child.ctx.availableTools(), expected);
   assert.equal(f.child.ctx.denied('write'), role.tools !== undefined);
   assert.equal(f.child.ctx.denied('scope-local'), role.tools !== undefined);
+  assert.equal(f.child.ctx.denied('run_code'), false);
+  assert.equal(f.child.ctx.denied('run_code', {}), role.tools !== undefined);
+  assert.equal(f.child.ctx.denied('read', {}), role.tools !== undefined && !role.tools.includes('read'));
   assert.deepEqual(f.ctx.roleText(), []);
   assert.deepEqual(f.other.ctx.roleText(), []);
   assert.deepEqual(f.ctx.availableTools(), ['read', 'write', 'search']);
@@ -233,7 +251,7 @@ for (const live of [false, true]) test(`role is installed before ${live ? 'live'
   await tick();
   assert.deepEqual(f.child.ctx.roleText(), ['Activation only']);
   assert.deepEqual(f.child.ctx.availableTools(), []);
-  assert.equal(f.child.ctx.denied('run_code'), true);
+  assert.equal(f.child.ctx.denied('run_code'), false);
   gate.resolve(); await tick();
   await f.end();
   assert.deepEqual(f.child.ctx.roleText(), []);
