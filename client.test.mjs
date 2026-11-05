@@ -305,6 +305,76 @@ for (const detail of [false, true]) test(`approved review loops label skipped ro
   assert.equal(elements(tree, item => item.type === 'button' && (detail ? item.props['aria-label'] === 'result · quality' : item.props.className === 'dwf-result-link')).length, 1, 'the gate still exposes its report');
 });
 
+for (const detail of [false, true]) test(`parallel members share one logical stage in ${detail ? 'details' : 'cards'}`, async () => {
+  let cursor = 0;
+  const opened = [], queries = [];
+  const registration = (await fixture({ useState(initial) { return [cursor++ === 0 ? detail : initial, () => {}]; } }, {}, {
+    fetch: async path => { queries.push(JSON.parse(new URL(path, 'http://localhost').searchParams.get('args'))); return { ok: true, json: async () => ({ node: { output: { first: 'done' } } }) }; },
+  }, { openSession: target => opened.push(target) })).find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'members-run', status: 'running', nodes: {
+    'research/agent/first': { status: 'completed', agentId: 'writer', agentSessionId: 'writer-child', agentStep: { groupId: 'research', kind: 'member', memberId: 'first' } },
+    'research/agent/second': { status: 'running', agentId: 'critic', agentSessionId: 'critic-child', agentStep: { groupId: 'research', kind: 'member', memberId: 'second' } },
+    research: { title: 'Research', status: 'pending', agentStep: { groupId: 'research', kind: 'collect', members: ['first', 'second'] } },
+    deliver: { title: 'Deliver', status: 'pending', deps: ['research'], agentId: 'writer' },
+  } };
+  const card = registration.component({ t: key => key, ...registration.options.inject('parent'), node: { data: { run } } });
+  const tree = card.type(card.props);
+  const area = elements(tree, item => item.props.className === (detail ? 'dwf-timeline' : 'dwf-stages'))[0];
+  const stages = elements(area, item => detail ? item.props.className === 'dwf-node' : item.props.className?.split(' ').includes('dwf-stage'));
+  assert.equal(stages.length, 2, 'members and collect must share their original logical stage');
+  assert.equal(elements(stages[0], item => item.props.className === 'dwf-count')[0].props.children[0], '1/2');
+  assert.equal(elements(stages[0], item => item.props.className === 'dwf-dot running').length, 1, 'an active member makes its pending collect stage running');
+  const capsules = elements(stages[0], item => item.props.className === 'dwf-agent');
+  assert.deepEqual(Array.from(capsules, item => item.props['data-agent-id']), ['writer', 'critic']);
+  for (const capsule of capsules) capsule.props.onClick();
+  assert.deepEqual(Array.from(opened, target => target.childSessionId), ['writer-child', 'critic-child']);
+  if (detail) {
+    await elements(stages[0], item => item.props['aria-label'] === 'result · Research')[0].props.onClick();
+    assert.deepEqual(queries, [{ action: 'status', runId: 'members-run', nodeId: 'research' }]);
+  }
+});
+
+test('a failed member keeps its logical stage failed when collect is blocked', async () => {
+  const registration = (await fixture()).find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'failed-member', status: 'failed', nodes: {
+    'work/agent/one': { status: 'failed', agentId: 'one', agentSessionId: 'one-child', agentStep: { groupId: 'work', kind: 'member', memberId: 'one' } },
+    work: { status: 'blocked', agentStep: { groupId: 'work', kind: 'collect', members: ['one'] } },
+  } };
+  const card = registration.component({ t: key => key, ...registration.options.inject('parent'), node: { data: { run } } });
+  const tree = card.type(card.props);
+  assert.equal(elements(tree, item => item.props.className === 'dwf-dot failed').length, 1);
+});
+
+test('detail stages expose a result action for each parallel member', async () => {
+  const queries = [];
+  let cursor = 0;
+  const registration = (await fixture({ useState: initial => [cursor++ === 0 ? true : initial, () => {}] }, {}, { fetch: async path => { queries.push(JSON.parse(new URL(path, 'http://localhost').searchParams.get('args'))); return { ok: true, json: async () => ({ node: { output: 'member result' } }) }; } })).find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'member-output', status: 'running', nodes: {
+    'work/agent/one': { status: 'completed', agentId: 'one', agentSessionId: 'one-child', agentStep: { groupId: 'work', kind: 'member', memberId: 'one' } },
+    work: { status: 'completed', agentStep: { groupId: 'work', kind: 'collect', members: ['one'] } },
+  } };
+  const card = registration.component({ t: key => key, ...registration.options.inject('parent'), node: { data: { run } } });
+  const tree = card.type(card.props);
+  const action = elements(tree, item => item.type === 'button' && item.props['aria-label'] === 'result · one')[0];
+  assert.ok(action, 'each detailed member must expose its own result action');
+  await action.props.onClick();
+  assert.deepEqual(queries, [{ action: 'status', runId: 'member-output', nodeId: 'work/agent/one' }]);
+});
+
+test('completed collect gates do not inflate stage progress or Agent totals', async () => {
+  const registration = (await fixture()).find(item => item.options.name === 'conversation.chat.node');
+  const run = { runId: 'done', status: 'completed', nodes: {
+    'work/agent/one': { status: 'completed', agentId: 'one', agentSessionId: 'one-child', agentStep: { groupId: 'work', kind: 'member', memberId: 'one' } },
+    'work/agent/two': { status: 'completed', agentId: 'two', agentSessionId: 'two-child', agentStep: { groupId: 'work', kind: 'member', memberId: 'two' } },
+    work: { status: 'completed', agentStep: { groupId: 'work', kind: 'collect', members: ['one', 'two'] } },
+  } };
+  const card = registration.component({ t: key => key, ...registration.options.inject('parent'), node: { data: { run } } });
+  const tree = card.type(card.props);
+  assert.equal(elements(tree, item => item.props.className === 'dwf-count')[0].props.children[0], '2/2');
+  assert.ok(elements(tree, item => item.props.className === 'dwf-meta').some(item => item.props.children[0] === '1 stages · 2 agents'));
+  assert.equal(elements(tree, item => item.props.className === 'dwf-agent').length, 2);
+});
+
 test('inspection results and malformed tool text never create a workflow card', async () => {
   const registration = (await fixture()).find(item => item.options.key === 'dynamic_workflow');
   for (const [action, text] of [['list', '{"runs":[]}'], ['run', 'failed to read workflow file']]) {

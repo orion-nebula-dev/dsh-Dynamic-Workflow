@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
         empty: '当前会话还没有工作流。输入工作流 JSON 文件路径，或让助手根据任务创建工作流。',
         path: '工作流文件路径', pathPlaceholder: '例如 workflow.json', start: '运行工作流',
         history: '运行记录', model: '子 Agent 模型', inherit: '沿用已有模型配置',
-        concurrency: '最多同时运行', parallelAgents: '个代理同时运行', stop: '停止运行', resume: '继续工作流', switch: '切换模型并继续',
+        concurrency: '当前节点内 Agent 并发上限', parallelAgents: '个 Agent 在当前节点内同时运行', serialNodesNote: '顶层节点按顺序依次执行；并发上限仅作用于当前节点内的 Agent。', stop: '停止运行', resume: '继续工作流', switch: '切换模型并继续',
         modelNote: '继续前先停止并清理当前执行。已完成结果保留，未完成节点恢复原 Agent 会话后使用所选模型。',
         agentSession: 'Agent 会话', contextResumed: '原会话续跑', contextMissing: '此记录缺少部分 Agent 会话，无法恢复对应节点的上下文。',
         reviewNote: '存在待核查节点。请让助手检查中断产生的影响，更新工作流后再运行。',
@@ -28,7 +28,7 @@ window.__ModuleLoader__.load({
         busy: '处理中…', saved: '历史已保存', requestFailed: '操作失败', unknownCommand: '工作流命令未启用',
         modelError: '部分模型列表加载失败', output: '节点结果', copied: '已复制', copy: '复制 JSON',
         required: '请填写工作流文件路径', allDone: '所有节点已完成', changed: '模型选择仅在运行或继续后生效',
-        invalidConcurrency: '同时运行的节点数量须为 1–8 的整数。', legacy: '此记录未保存工作流定义。请填写原文件路径重新运行。',
+        invalidConcurrency: '当前节点内同时运行的 Agent 数量须为 1–8 的整数。', legacy: '此记录未保存工作流定义。请填写原文件路径重新运行。',
       },
       en: {
         configIntro: 'Configure global task classification for dynamic workflows.', globalMode: 'Global mode',
@@ -40,7 +40,7 @@ window.__ModuleLoader__.load({
         empty: 'No workflow in this session yet. Enter a workflow JSON path or ask the assistant to create one.',
         path: 'Workflow file path', pathPlaceholder: 'For example workflow.json', start: 'Run workflow',
         history: 'Run history', model: 'Subagent model', inherit: 'Keep existing model configuration',
-        concurrency: 'Concurrent nodes', parallelAgents: 'agents in parallel', stop: 'Stop run', resume: 'Continue workflow', switch: 'Switch model and continue',
+        concurrency: 'Agent concurrency limit within the current node', parallelAgents: 'Agents in parallel within the current node', serialNodesNote: 'Top-level nodes run sequentially; the concurrency limit applies only to Agents within the current node.', stop: 'Stop run', resume: 'Continue workflow', switch: 'Switch model and continue',
         modelNote: 'Stops and drains active work first. Completed results are kept; unfinished nodes restore their original Agent sessions with the selected model.',
         agentSession: 'Agent session', contextResumed: 'Session continued', contextMissing: 'Some historical Agent sessions are missing; their context cannot be restored.',
         reviewNote: 'Some nodes require review. Ask the assistant to check interrupted effects and update the workflow before running again.',
@@ -51,7 +51,7 @@ window.__ModuleLoader__.load({
         busy: 'Working…', saved: 'History saved', requestFailed: 'Operation failed', unknownCommand: 'Workflow command is unavailable',
         modelError: 'Some model catalogs could not be loaded', output: 'Node result', copied: 'Copied', copy: 'Copy JSON',
         required: 'Enter a workflow file path', allDone: 'All nodes completed', changed: 'Model selection takes effect when you run or continue',
-        invalidConcurrency: 'Concurrent nodes must be an integer from 1 to 8.', legacy: 'This record has no saved definition. Run it again using the original file path.',
+        invalidConcurrency: 'The concurrent Agent limit within the current node must be an integer from 1 to 8.', legacy: 'This record has no saved definition. Run it again using the original file path.',
       },
     };
     const css = `
@@ -227,16 +227,33 @@ window.__ModuleLoader__.load({
       if (!sessionId) return null;
       const workflow = detail?.runId === active?.runId ? detail?.workflow : undefined;
       const nodes = active?.nodes || {};
-      const entries = Object.entries(nodes);
+      const rawEntries = Object.entries(nodes);
+      const groups = new Map();
+      for (const [id, node] of rawEntries) {
+        const groupId = node.agentStep?.groupId || id;
+        if (!groups.has(groupId)) groups.set(groupId, []);
+        groups.get(groupId).push([id, node]);
+      }
+      const entries = [...groups].map(([id, group]) => {
+        const collect = group.find(([, node]) => node.agentStep?.kind === 'collect');
+        const members = group.filter(([, node]) => node.agentStep?.kind === 'member');
+        if (!members.length) return collect || group[0];
+        const gate = collect?.[1] || {};
+        const memberStatus = ['running', 'needs_review', 'failed', 'interrupted', 'cancelled', 'blocked'].find(state => members.some(([, node]) => node.status === state));
+        const stageStatus = gate.status === 'blocked' && memberStatus === 'failed' ? 'failed' : gate.status && gate.status !== 'pending' ? gate.status : memberStatus || 'pending';
+        return [id, { ...gate, status: stageStatus,
+          deps: members.flatMap(([, node]) => node.deps || []), stageMembers: members }];
+      });
       const completed = entries.filter(([, node]) => node.status === 'completed').length;
       const working = entries.filter(([, node]) => node.status === 'running').length;
-      const agentCount = new Set(entries.map(([, node]) => node.agentSessionId).filter(Boolean)).size;
-      const needsReview = entries.some(([, node]) => node.status === 'needs_review');
+      const agentEntries = rawEntries.filter(([, node]) => node.reviewStep?.kind !== 'gate' && node.agentStep?.kind !== 'collect');
+      const agentCount = new Set(agentEntries.map(([, node]) => node.agentSessionId).filter(Boolean)).size;
+      const needsReview = rawEntries.some(([, node]) => node.status === 'needs_review');
       const workflowTitle = run => typeof run.title === 'string' && run.title.trim() ? run.title : run.workflowPath;
       const nodeTitle = (id, state) => [state.title, workflow?.nodes?.find(node => node.id === id)?.title].find(value => typeof value === 'string' && value.trim()) || id;
       const agentTitle = (id, state) => [state.agentTitle, workflow?.nodes?.find(node => node.id === id)?.agentTitle].find(value => typeof value === 'string' && value.trim()) || nodeTitle(id, state);
       const agentIdentity = (id, node) => node.agentId || node.agentSessionId || id;
-      const capsuleAgents = [...new Set(entries.filter(([, node]) => node.reviewStep?.kind !== 'gate').map(([id, node]) => agentIdentity(id, node)))];
+      const capsuleAgents = [...new Set(agentEntries.map(([id, node]) => agentIdentity(id, node)))];
       const status = value => t(value) || value;
       const button = (label, onClick, more = {}) => h('button', { type: 'button', onClick, disabled: busy, ...more }, label);
       const iconButton = (name, label, onClick, more = {}) => button(icon(name), onClick, { className: 'dwf-icon-button', title: label, 'aria-label': label, ...more });
@@ -244,8 +261,10 @@ window.__ModuleLoader__.load({
       if (selection && !(catalog?.groups || []).some(group => group.models.some(model => selection === JSON.stringify([group.id, model.id])))) options.push(h('option', { key: 'current', value: selection }, JSON.parse(selection).filter(Boolean).join(' / ')));
       const dot = state => h('span', { className: `dwf-dot ${state}`, 'aria-hidden': true });
       const nodeStatus = node => status(node.skipped ? 'skipped' : node.status);
-      const count = node => node.skipped ? t('skipped') : `${node.status === 'completed' ? 1 : 0}/1`;
+      const count = node => node.stageMembers ? `${node.stageMembers.filter(([, member]) => member.status === 'completed').length}/${node.agentStep?.members?.length || node.stageMembers.length}` : node.skipped ? t('skipped') : `${node.status === 'completed' ? 1 : 0}/1`;
       const agentRow = (id, node, detailed = false) => {
+        if (node.stageMembers) return node.stageMembers.map(([memberId, member]) => h(React.Fragment, { key: memberId }, agentRow(memberId, member, detailed)));
+        if (node.agentStep?.kind === 'collect') return null;
         if (node.reviewStep?.kind === 'gate') return h('div', { className: 'dwf-review-gate' }, h('span', { className: 'dwf-meta' }, `${t('reviewGate')} · ${nodeStatus(node)}`));
         const agentName = agentTitle(id, node), name = node.roleTitle || agentName;
         const round = node.reviewStep ? ` · ${t('reviewRound')} ${node.reviewStep.round}/${node.reviewStep.maxRounds}` : '';
@@ -254,7 +273,7 @@ window.__ModuleLoader__.load({
         const end = h('span', { className: 'dwf-agent-end' }, detailed && h('span', { className: 'dwf-task-label' }, t('oneTask')), node.skipped ? h('span', { className: 'dwf-meta' }, t('skipped')) : node.status === 'completed' ? icon('check', 17) : node.status === 'running' ? h('span', { className: 'dwf-spinner', 'aria-hidden': true }) : h('span', { className: 'dwf-meta' }, nodeStatus(node)));
         const props = { className: 'dwf-agent', 'data-agent-id': agentIdentity(id, node), 'data-agent-session-id': node.agentSessionId,
           title: `${agentName} · ${name}${round} · ${nodeStatus(node)}${node.agentSessionId ? ` · ${node.agentSessionId}` : ''}` };
-        return h('button', { ...props, type: 'button', disabled: !node.agentSessionId, 'aria-label': `${t('agentSession')} · ${agentName}`, onClick: () => {
+        const capsule = h('button', { ...props, type: 'button', disabled: !node.agentSessionId, 'aria-label': `${t('agentSession')} · ${agentName}`, onClick: () => {
           if (!node.agentSessionId) return;
           try {
             // A durable parent/child address also opens children absent from the local list.
@@ -263,6 +282,8 @@ window.__ModuleLoader__.load({
             setOpen(false);
           } catch (failure) { setError(failure?.message || String(failure)); }
         } }, avatar, h('span', { className: 'dwf-agent-name' }, name, node.reviewStep && h('span', { className: 'dwf-meta' }, round)), end);
+        if (!detailed) return capsule;
+        return h('div', { className: 'dwf-agent-detail' }, capsule, iconButton('chevron', `${t('result')} · ${node.agentStep?.memberId || agentName}`, () => showOutput(id), { disabled: false }));
       };
       const stages = entries.length ? h('div', { className: 'dwf-stages', 'aria-label': t('stages') }, entries.map(([id, node], index) => {
         const next = entries[index + 1]?.[1], linked = next?.deps?.includes(id);
@@ -296,18 +317,21 @@ window.__ModuleLoader__.load({
         !fixedRunId && runs.length > 0 && h('label', { className: 'dwf-field' }, h('span', null, t('history')), h('select', { className: 'dwf-history', value: selectedId, disabled: busy, onChange: event => setSelectedId(event.target.value) }, runs.map(run => h('option', { key: run.runId, value: run.runId }, `${status(run.status)} · ${workflowTitle(run)} · ${new Date(run.createdAt).toLocaleString()}`)))),
         h('div', { className: 'dwf-settings-row' }, h('span', null, t('model')), h('select', { className: 'dwf-model-select', 'aria-label': t('model'), value: selection, disabled: busy, onChange: event => setSelection(event.target.value), title: t('changed') }, h('option', { value: '' }, t('inherit')), ...options)),
         h('div', { className: 'dwf-settings-row' }, h('span', null, t('atMost')), h('div', { className: 'dwf-stepper' }, button('−', () => setConcurrency(value => Math.max(1, Number(value) - 1)), { disabled: busy || Number(concurrency) <= 1, 'aria-label': t('decrease') }), h('input', { type: 'number', min: 1, max: 8, step: 1, 'aria-label': t('concurrency'), value: concurrency, disabled: busy, onChange: event => setConcurrency(event.target.value) }), button('+', () => setConcurrency(value => Math.min(8, Number(value) + 1)), { disabled: busy || Number(concurrency) >= 8, 'aria-label': t('increase') })), h('span', null, t('parallelAgents'))),
+        h('p', { className: 'dwf-notice' }, t('serialNodesNote')),
         h('p', { className: 'dwf-notice' }, t('modelNote')),
         catalogError && h('p', { className: 'dwf-error', role: 'alert' }, `${t('modelError')}: ${catalogError}`),
         (catalog?.failures || []).map(failure => h('p', { key: failure.id, className: 'dwf-meta' }, `${t('modelError')} · ${failure.name}: ${failure.message}`)),
         active && completed < entries.length && h('div', { className: 'dwf-toolbar' }, button(busy ? t('busy') : t(active.status === 'running' ? 'switch' : 'resume'), () => operate('resume'), { className: 'dwf-primary', disabled: busy || active.resumeSupported === false || needsReview || (entries.length > 0 && completed === entries.length) })),
         !fixedRunId && h('form', { className: 'dwf-controls', style: { marginTop: 18 }, onSubmit: event => { event.preventDefault(); operate('run'); } }, h('label', { className: 'dwf-field grow' }, h('span', null, t('path')), h('input', { type: 'text', value: path, placeholder: t('pathPlaceholder'), disabled: busy, onChange: event => setPath(event.target.value) })), h('button', { type: 'submit', className: 'dwf-primary', disabled: busy || !path.trim() }, busy ? t('busy') : t('start'))));
       const timeline = h('ol', { className: 'dwf-timeline' }, entries.map(([id, node]) => {
-        const output = nodeOutput?.runId === active.runId && nodeOutput.id === id ? nodeOutput.value : undefined;
+        const outputNode = nodeOutput?.runId === active.runId && (nodeOutput.id === id || node.stageMembers?.some(([memberId]) => nodeOutput.id === memberId)) ? nodeOutput : undefined;
+        const output = outputNode?.value;
+        const outputMember = node.stageMembers?.find(([memberId]) => memberId === outputNode?.id)?.[1];
         const value = output && Object.hasOwn(output, 'output') ? output.output : output;
         return h('li', { className: 'dwf-node', key: id }, dot(node.skipped ? 'skipped' : node.status),
           h('div', { className: 'dwf-node-heading' }, h('strong', null, nodeTitle(id, node)), node.reused && h('span', { className: 'dwf-meta' }, t('reused')), h('span', { className: 'dwf-count' }, count(node)), iconButton('chevron', `${t('result')} · ${nodeTitle(id, node)}`, () => showOutput(id))),
           agentRow(id, node, true),
-          output !== undefined && h('div', { className: 'dwf-output' }, node.agentSessionId && h('span', { className: 'dwf-short-id dwf-muted' }, `${t('agentSession')} ${node.agentSessionId}${node.continuations > 0 ? ` · ${t('contextResumed')}` : ''}`), h('pre', null, typeof value === 'string' ? value : JSON.stringify(value, null, 2))));
+          output !== undefined && h('div', { className: 'dwf-output' }, (outputMember?.agentSessionId || node.agentSessionId) && h('span', { className: 'dwf-short-id dwf-muted' }, `${t('agentSession')} ${outputMember?.agentSessionId || node.agentSessionId}${(outputMember?.continuations || node.continuations) > 0 ? ` · ${t('contextResumed')}` : ''}`), h('pre', null, typeof value === 'string' ? value : JSON.stringify(value, null, 2))));
       }));
       const panel = open && h(React.Fragment, null,
         h('div', { className: 'dwf-backdrop', onClick: () => setOpen(false) }),

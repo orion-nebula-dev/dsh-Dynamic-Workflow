@@ -48,6 +48,7 @@ function brief(record, snapshot = record.snapshot, nodeId) {
       return [id, { status: node.status, reused: node.reused === true,
         ...(node.skipped === true ? { skipped: true } : {}),
         ...(definition?.reviewStep ? { reviewStep: definition.reviewStep } : {}),
+        ...(definition?.agentStep ? { agentStep: definition.agentStep } : {}),
         ...(typeof definition?.title === 'string' ? { title: definition.title } : {}),
         ...(typeof definition?.agentTitle === 'string' ? { agentTitle: definition.agentTitle } : {}),
         ...(typeof definition?.agentId === 'string' ? { agentId: definition.agentId } : {}),
@@ -179,7 +180,7 @@ export async function apply(ctx, config = {}) {
   });
   ctx.effect(() => ctx.tools.register({
     name: 'dynamic_workflow',
-    description: 'Run a JSON DAG, resume or revise a saved run, inspect progress, message a running node, list models, stop execution, or read/update the global workflow setting. Workflow agentId names are not Team teammate targets; use message to steer the existing child. A message receipt confirms inbox acceptance, not task completion. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent. A node may define reviewLoop:{review:{agentId,prompt,role?},fix:{agentId,prompt,role?},maxRounds:3}. Distinct review/fix Agents run at most maxRounds reviews including the initial review (default 3, range 1–50). Reviews return {verdict:"approved"|"changes-required",findings:[{message,evidence}]}; approval requires empty findings, rejection requires findings. Approval skips unused rounds; exhaustion fails the original node and blocks its dependents.',
+    description: 'Run JSON workflow nodes serially, resume or revise a saved run, inspect progress, message a running Agent, list models, stop execution, or read/update the global workflow setting. Workflow agentId names are not Team teammate targets; use message to steer the existing child. A message receipt confirms inbox acceptance, not task completion. State survives plugin restart. Run reads the current JSON; resume uses the saved definition and snapshot, stopping active execution first. Unchanged completed nodes are reused across model switches. Unfinished nodes resume their original persisted Agent session and history when its identity and fingerprint are verified; a missing saved Agent is an error. Legacy interruptions require review unless retrySafe is true. JSON nodes use id, prompt (or string input), deps, optional provider/model/schema/retrySafe. Nodes run one at a time in stable dependency order. For multiple Agents within one node, use agents:[{id,agentId,prompt,role?,provider?,model?,schema?,retrySafe?}] and optional agentConcurrency (1–8); outputs are collected by member id. Use internal member ids from status for message or member result inspection. For persistent capsules, define agents:{id:{title}}, roles:{id:{prompt,title?,tools?}}, and node agentId/role. The same agentId reuses one Agent across serial stages, applying each role before activation. tools:[] denies tools; omitted tools inherit. Changed executed shared stages require a new workflow id; appended stages keep the Agent. A node may define reviewLoop:{review:{agentId,prompt,role?},fix:{agentId,prompt,role?},maxRounds:3}. Distinct review/fix Agents run at most maxRounds reviews including the initial review (default 3, range 1–50). Reviews return {verdict:"approved"|"changes-required",findings:[{message,evidence}]}; approval requires empty findings, rejection requires findings. Approval skips unused rounds; exhaustion fails the original node and blocks its dependents.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['action'],
       properties: {
@@ -191,7 +192,7 @@ export async function apply(ctx, config = {}) {
         nodeId: { type: 'string', description: 'For message: required running node id from status. For status: include its result, truncated at 12000 characters.' },
         message: { type: 'string', minLength: 1, maxLength: LIMIT, description: 'For message: required nonblank text to deliver to the running node.' },
          revisionReason: { type: 'string', description: 'For revise: the user message or concise reason that caused the workflow change.' },
-        concurrency: { type: 'integer', minimum: 1, maximum: 8, description: 'For run/resume: simultaneous nodes, 1–8; run defaults to 1, resume to the saved value.' },
+        concurrency: { type: 'integer', minimum: 1, maximum: 8, description: 'For run/resume: maximum concurrent Agents within the current node, 1–8, further limited by node.agentConcurrency. Nodes stay serial. Run defaults to 1; resume uses the saved value.' },
         globalEnabled: { type: 'boolean', description: 'For settings: optionally set the global workflow switch; omit to read it.' },
       },
     },
@@ -376,7 +377,9 @@ export async function apply(ctx, config = {}) {
         loadedWorkflow = validateWorkflow(JSON.parse(new TextDecoder().decode(sourceBytes)));
       }
       if (loadedWorkflow.nodes.length > 100) throw new Error('Workflow exceeds 100 nodes');
-      for (const node of loadedWorkflow.nodes) nodeRequest(node, {}, { model: args.model, provider: args.provider });
+      for (const node of loadedWorkflow.nodes) {
+        if (node.agentStep?.kind !== 'collect') nodeRequest(node, {}, { model: args.model, provider: args.provider });
+      }
       if (closed || exec.signal?.aborted) throw new Error('Run cancelled before start');
       const matching = [...records.values()].filter(record => ownerMatches(record, owner) && record.key === target.targetKey);
       if (matching.some(record => record.status === 'running')) throw new Error('Workflow is already running');
@@ -419,7 +422,7 @@ export async function apply(ctx, config = {}) {
             }
           }
           if (resumeSource) {
-            const missing = loadedWorkflow.nodes.filter(node => node.reviewStep?.kind !== 'gate'
+            const missing = loadedWorkflow.nodes.filter(node => node.reviewStep?.kind !== 'gate' && node.agentStep?.kind !== 'collect'
               && ['running', 'interrupted', 'needs_review', 'failed'].includes(prior.snapshot?.nodes?.[node.id]?.status)
               && !record.nodeSessions[node.id]);
             if (missing.length) record.contextWarning = `Historical Agent identity unavailable for nodes: ${missing.map(node => node.id).join(', ')}. Normal retry/review rules apply.`;

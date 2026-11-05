@@ -2,7 +2,9 @@
 
 [简体中文](README.md) | English
 
-Run JSON DAG workflows in Harness with a progress UI, executor model selection, reuse of valid completed results, and persisted capsule Agent sessions that can continue across stages and model changes.
+Run JSON workflows in Harness with strictly serial logical nodes and optional parallel Agents within each node. Completed results can be persisted and reused. Capsule Agent sessions retain their history across stages and model changes.
+
+This document describes the workflow contract for the current source tree. It does not indicate that an installed live plugin or a released version has been updated.
 
 ## Install
 
@@ -51,7 +53,7 @@ The old `/dynamic-workflow` command remains available as a compatibility entry p
 
 1. Open **Workflow** in the upper-right corner of the session to view run details.
 2. Open **Run configuration** and enter a **Workflow file path**, such as `dynamic-workflow/workflow.example.json` for the bundled example.
-3. Select a **Subagent model** and concurrency, then click **Run workflow**. The model list comes from the current Harness configuration.
+3. Select a **Subagent model** and the concurrency limit for Agents within a node, then click **Run workflow**. The model list comes from the current Harness configuration.
 4. Select the run in **Run history** to inspect stage progress. Click an Agent row for its node result or **View workflow definition** to check the task.
 5. To change models, select another model and click **Switch model and continue**. The next section describes the continuation rules.
 
@@ -125,11 +127,40 @@ Legacy independent nodes without `agentId` keep the original behavior: changing 
 
 Nodes can specify `provider`, `model`, and a structured output `schema`. If a node omits model configuration, it uses the run or session configuration.
 
+## Serial nodes and multiple Agents per node
+
+Nodes run one at a time in stable topological order, preserving definition order when topology permits. The current node finishes before the next node is processed. Serial scheduling adds no `deps` between unrelated nodes: a failure blocks its dependent successors, while independent nodes can still run.
+
+Use an `agents` array for a multi-Agent node with collect mode:
+
+```json
+{
+  "id": "analyze",
+  "agentConcurrency": 2,
+  "agents": [
+    { "id": "plan", "agentId": "planner", "prompt": "Propose a plan.", "tools": [] },
+    { "id": "risk", "agentId": "reviewer", "prompt": "List risks.", "tools": [] }
+  ]
+}
+```
+
+Each member has an `id` unique within its node, an `agentId` referring to a stable identity in top-level `agents`, and a task `prompt`. An optional `role` refers to a top-level role. Members can also specify `tools`, `provider`, `model`, `schema`, and `retrySafe`. `agentConcurrency` is an integer from 1 to 8 and defaults to `min(8, member count)`, still bounded by the run's concurrency limit.
+
+The Host statically expands members into `analyze/agent/plan` and `analyze/agent/risk`. The original `analyze` node remains a collect gate. It waits for all members to succeed and returns an object keyed by member `id`, such as `{"plan":"plan result","risk":"risk result"}`. Successors depend on `analyze` to receive the collected result. Member results are persisted separately, so valid successful results can be reused on continuation. To send a `message` to an active member, use its internal node ID returned by `status`, such as `analyze/agent/plan`.
+
+The [multi-Agent example](workflow.multi-agent.example.json) collects two analyses in parallel, then runs delivery serially. All roles and members have empty tool lists. Pass these arguments to the `dynamic_workflow` tool to explicitly allow two members to run in parallel:
+
+```json
+{"action":"run","workflowPath":"dynamic-workflow/workflow.multi-agent.example.json","concurrency":2}
+```
+
+You can also append these JSON arguments to `/workflow`. Running only the file path defaults to concurrency 1; `agentConcurrency: 2` in the file cannot raise the run limit.
+
 ## Capsule agents and stage roles
 
-Each capsule represents one Agent. `agents` defines stable Agent identities, and a node's `agentId` binds it to an identity. Stages with the same `agentId` share a native Agent session ID, message history, and tool results.
+Each capsule represents one Agent. Top-level `agents` defines stable Agent identities. A node or node member binds to an identity through `agentId`. Stages with the same `agentId` share a native Agent session ID, message history, and tool results.
 
-Different Agents can run in parallel. Stages belonging to the same Agent execute serially in the DAG's stable topological order. Even if dependencies between successive stages are omitted, the executor will not activate that Agent concurrently.
+All logical nodes execute one at a time in stable topological order. Agents can run in parallel only within the same multi-Agent node. The same Agent is always activated serially.
 
 `roles` defines stage roles. Each role has a `prompt` and optional `title` and `tools`. Nodes reference a role through `role`. Before each activation, the executor installs the current role's system prompt and tool policy. Afterward, it clears them before installing the next stage's role. Switching roles preserves history, so earlier prompts may remain in historical context. The capsule shows the current role; its avatar color and hover information correspond to the stable Agent identity.
 
@@ -211,7 +242,7 @@ The tool is named `dynamic_workflow`. The `/workflow` session command invokes th
 | `stop` | `runId` | Cancel execution and wait for child Agent cleanup |
 | `list` | None | Query the current session's run history |
 
-`concurrency` ranges from 1 to 8. `run` defaults to 1. `resume` retains the original run's value unless explicitly overridden. Use actual model identifiers from the model directory.
+`concurrency` limits the number of Agents running within the current node, from 1 to 8. It no longer allows top-level nodes to run concurrently. `run` defaults to 1. `resume` retains the original run's value unless explicitly overridden. A node's `agentConcurrency` can lower this limit; effective concurrency is at most the smaller of the two values. The workflow JSON file does not support a top-level `concurrency` field. Pass it through the tool call or `/workflow` JSON arguments. Use actual model identifiers from the model directory.
 
 ## Persistence and limits
 

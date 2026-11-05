@@ -97,16 +97,30 @@ test('does not reuse corrupted output or results belonging to another workflow',
   assert.deepEqual(calls, ['a', 'b']);
 });
 
-test('runs independent nodes concurrently without exceeding the limit', async () => {
+test('runs nodes serially and collects multiple agents in one node concurrently', async () => {
   const { statePath } = await fixture();
-  let active = 0, maximum = 0;
-  const workflow = { id: 'parallel', nodes: ['a', 'b', 'c', 'd'].map(id => ({ id })) };
-  const state = await core.runWorkflow({ workflow, statePath, concurrency: 2, executor: async () => {
+  let active = 0, maximum = 0, order = [];
+  const workflow = {
+    id: 'serial-nodes',
+    nodes: [
+      { id: 'first' },
+      { id: 'second', deps: ['first'], agents: [
+        { id: 'review', agentId: 'reviewer', prompt: 'Review' },
+        { id: 'audit', agentId: 'auditor', prompt: 'Audit' },
+      ] },
+      { id: 'third', deps: ['second'] },
+    ],
+  };
+  const state = await core.runWorkflow({ workflow, statePath, concurrency: 8, executor: async node => {
+    order.push(node.id);
     active++; maximum = Math.max(maximum, active);
     await new Promise(resolve => setTimeout(resolve, 10));
-    active--; return 1;
+    active--;
+    return node.id;
   } });
   assert.equal(maximum, 2);
+  assert.deepEqual(order, ['first', 'second/agent/review', 'second/agent/audit', 'third']);
+  assert.deepEqual(state.nodes.second.output, { review: 'second/agent/review', audit: 'second/agent/audit' });
   assert.equal(state.status, 'completed');
   for (const concurrency of [0, -1, 1.2, Infinity]) {
     await assert.rejects(core.runWorkflow({ workflow, statePath, concurrency, executor: async () => 1 }), /concurrency/i);
@@ -375,7 +389,7 @@ test('chains explicit agents in stable topological order for unordered definitio
   assert.equal(Object.hasOwn(workflow.nodes[2], 'deps'), false);
 });
 
-test('serializes one agent while distinct agents execute in parallel', async () => {
+test('serializes logical nodes even for distinct agent identities', async () => {
   const { statePath } = await fixture();
   const active = new Set();
   let maximum = 0;
@@ -392,8 +406,8 @@ test('serializes one agent while distinct agents execute in parallel', async () 
     return node.id;
   } });
   assert.equal(result.status, 'completed');
-  assert.equal(maximum, 2);
-  assert.deepEqual(new Set(completed), new Set(['first', 'second', 'other']));
+  assert.equal(maximum, 1);
+  assert.deepEqual(completed, ['first', 'second', 'other']);
 });
 
 test('earlier same-agent input and role changes invalidate later cached history', async () => {
@@ -575,6 +589,188 @@ test('review loop IDs containing fix segments preserve their exact dependency pr
   } }] });
   assert.deepEqual(workflow.nodes.find(node => node.id === `${id}/review/2`).deps, [`${id}/fix/1`, `${id}/review/1`]);
   assert.deepEqual(core.validateWorkflow(workflow), workflow);
+});
+
+const agentGroup = () => ({ id: 'members', nodes: [
+  { id: 'group', agents: [{ id: 'a', agentId: 'alice', prompt: 'A' }, { id: 'b', agentId: 'bob', prompt: 'B' }] },
+  { id: 'after', deps: ['group'] }, { id: 'independent' },
+] });
+
+test('agent groups expand idempotently with resolved roles and pure collect gates', () => {
+  const workflow = agentGroup();
+  workflow.roles = { writer: { prompt: 'Write', tools: [] } };
+  workflow.nodes[0].agents[0].role = 'writer';
+  const normalized = core.validateWorkflow(workflow);
+  assert.deepEqual(normalized.nodes.map(node => node.id), ['group/agent/a', 'group/agent/b', 'group', 'after', 'independent']);
+  assert.deepEqual(core.validateWorkflow(normalized), normalized);
+  assert.equal(normalized.nodes[0].rolePrompt, 'Write');
+  assert.deepEqual(normalized.nodes[0].tools, []);
+  assert.deepEqual(normalized.nodes[0].agentStep, { groupId: 'group', memberId: 'a', kind: 'member' });
+  assert.deepEqual(normalized.nodes[2].agentStep, { groupId: 'group', kind: 'collect', members: ['a', 'b'] });
+  assert.deepEqual(normalized.nodes[2].deps, ['group/agent/a', 'group/agent/b']);
+  assert.equal(normalized.nodes[2].retrySafe, true);
+});
+
+test('member limits honor global and local concurrency while independent logical nodes wait', async () => {
+  for (const [global, local, expected] of [[8, undefined, 2], [1, undefined, 1], [8, 1, 1]]) {
+    const workflow = agentGroup();
+    if (local !== undefined) workflow.nodes[0].agentConcurrency = local;
+    let active = 0, maximum = 0;
+    const calls = [];
+    const state = await core.runWorkflow({ workflow, storage: memoryStorage(), concurrency: global, executor: async node => {
+      calls.push(node.id);
+      if (!node.agentStep) assert.equal(active, 0);
+      active++; maximum = Math.max(active, maximum);
+      await new Promise(resolve => setTimeout(resolve, 5));
+      active--;
+      return node.id;
+    } });
+    assert.equal(maximum, expected);
+    assert.deepEqual(calls, ['group/agent/a', 'group/agent/b', 'after', 'independent']);
+    assert.deepEqual(state.nodes.group.output, { a: 'group/agent/a', b: 'group/agent/b' });
+  }
+});
+
+test('failed members settle before independent work and successful checkpoints survive retry', async () => {
+  const workflow = agentGroup(), storage = memoryStorage();
+  let active = 0;
+  const first = await core.runWorkflow({ workflow, storage, concurrency: 8, executor: async node => {
+    if (node.id === 'group/agent/a') throw new Error('member failed');
+    if (node.id === 'group/agent/b') {
+      active++; await new Promise(resolve => setTimeout(resolve, 10)); active--; return 'saved';
+    }
+    assert.equal(active, 0); return 'independent';
+  } });
+  assert.equal(first.nodes['group/agent/a'].status, 'failed');
+  assert.equal(first.nodes['group/agent/b'].status, 'completed');
+  assert.equal(first.nodes.group.status, 'blocked');
+  assert.equal(first.nodes.after.status, 'blocked');
+  assert.equal(first.nodes.independent.status, 'completed');
+  const calls = [];
+  const second = await core.runWorkflow({ workflow, storage, concurrency: 8, executor: async node => { calls.push(node.id); return 'new'; } });
+  assert.deepEqual(calls, ['group/agent/a', 'after']);
+  assert.equal(second.nodes['group/agent/b'].reused, true);
+  assert.deepEqual(second.nodes.group.output, { a: 'new', b: 'saved' });
+});
+
+test('agent group cancellation preserves completed members and resumes only verified interrupted identities', async () => {
+  const workflow = agentGroup(), storage = memoryStorage(), controller = new AbortController(), entered = deferred(), late = deferred();
+  const running = core.runWorkflow({ workflow, storage, concurrency: 1, signal: controller.signal, executor: async node => {
+    if (node.id === 'group/agent/a') return 'saved';
+    entered.resolve(); return late.promise;
+  } });
+  await entered.promise; controller.abort();
+  const interrupted = await running;
+  assert.equal(interrupted.nodes['group/agent/a'].status, 'completed');
+  assert.equal(interrupted.nodes['group/agent/b'].status, 'interrupted');
+  assert.equal(interrupted.nodes.group.status, 'pending');
+  const calls = [];
+  const resumed = await core.runWorkflow({ workflow, storage, resumeNodeIds: ['group/agent/b'], executor: async node => { calls.push(node.id); return 'new'; } });
+  assert.deepEqual(calls, ['group/agent/b', 'after', 'independent']);
+  assert.deepEqual(resumed.nodes.group.output, { a: 'saved', b: 'new' });
+  late.resolve('late'); await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(await storage.load(), resumed);
+});
+
+test('rejects invalid agent group configuration, structural fields, IDs and schemas', () => {
+  const changes = [
+    group => { group.agents = []; },
+    group => { group.agentId = 'x'; },
+    group => { group.role = 'x'; },
+    group => { group.reviewLoop = { review: { agentId: 'r', prompt: 'r' }, fix: { agentId: 'f', prompt: 'f' } }; },
+    group => { group.agents[1].id = 'a'; },
+    group => { group.agents[1].agentId = 'alice'; },
+    ...[0, 9, 1.2, null].map(value => group => { group.agentConcurrency = value; }),
+    ...['deps', 'agents', 'reviewLoop', 'agentStep', 'reviewStep'].map(field => group => { group.agents[0][field] = []; }),
+    group => { group.schema = { type: 'object' }; group.agents[0].schema = { type: 'string' }; },
+  ];
+  for (const change of changes) {
+    const workflow = agentGroup(); change(workflow.nodes[0]);
+    assert.throws(() => core.validateWorkflow(workflow));
+  }
+  const collision = agentGroup(); collision.nodes.push({ id: 'group/agent/a' });
+  assert.throws(() => core.validateWorkflow(collision), /collision/i);
+});
+
+test('a review loop remains one logical node before unrelated ready work', async () => {
+  const workflow = reviewWorkflow(2);
+  workflow.nodes.splice(2, 0, { id: 'independent' });
+  const calls = [];
+  const result = await core.runWorkflow({ workflow, storage: memoryStorage(), concurrency: 8, executor: async node => {
+    calls.push(node.id);
+    return node.reviewStep?.kind === 'review' ? (node.reviewStep.round === 1 ? changeReport : approvedReport) : 'done';
+  } });
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(calls, ['implement', 'q/review/1', 'q/fix/1', 'q/review/2', 'independent', 'after']);
+});
+
+test('group validation rejects malformed dependencies and generated metadata', () => {
+  for (const deps of ['', 'x', ['x', 'x'], 1, null, {}]) {
+    const workflow = agentGroup();
+    workflow.nodes[0].deps = deps; workflow.nodes.push({ id: 'x' });
+    assert.throws(() => core.validateWorkflow(workflow), /dependencies/i);
+  }
+  for (const value of [null, {}, { groupId: 'group', kind: 'collect', members: [] }]) {
+    assert.throws(() => core.validateWorkflow({ id: 'invalid-metadata', nodes: [{ id: 'group', agentStep: value }] }), /agentStep|agentConcurrency/i);
+  }
+});
+
+test('validates group and member role tools titles and schema defaults without silent overrides', () => {
+  for (const patch of [{ role: 'missing' }, { tools: ['read', 'read'] }, { agentTitle: 5 }, { agentId: '' }]) {
+    const workflow = agentGroup(); Object.assign(workflow.nodes[0].agents[0], patch);
+    assert.throws(() => core.validateWorkflow(workflow));
+  }
+  const invalid = agentGroup(); invalid.nodes[0].tools = 'invalid';
+  for (const member of invalid.nodes[0].agents) member.tools = [];
+  assert.throws(() => core.validateWorkflow(invalid), /tools/i);
+  const workflow = agentGroup(); workflow.nodes[0].schema = { type: 'object' };
+  workflow.nodes[0].agents[0].schema = { type: 'object' };
+  const result = core.validateWorkflow(workflow);
+  assert.deepEqual(result.nodes[0].schema, { type: 'object' });
+  assert.deepEqual(result.nodes[1].schema, { type: 'object' });
+});
+
+test('review templates reject nested groups and agent step metadata', () => {
+  for (const kind of ['review', 'fix']) {
+    for (const field of ['agents', 'agentStep', 'agentConcurrency']) {
+      const workflow = reviewWorkflow();
+      workflow.nodes[1].reviewLoop[kind][field] = [];
+      assert.throws(() => core.validateWorkflow(workflow), /template field/);
+    }
+  }
+});
+
+test('logical group scheduling uses stable topology without adding unrelated dependencies', async () => {
+  const workflow = agentGroup();
+  workflow.nodes[0].deps = ['input'];
+  workflow.nodes.splice(2, 0, { id: 'input' });
+  const calls = [], contexts = {};
+  const first = await core.runWorkflow({ workflow, storage: memoryStorage(), concurrency: 8, executor: async (node, context) => {
+    calls.push(node.id); contexts[node.id] = Object.keys(context.dependencies); return node.id;
+  } });
+  assert.equal(first.status, 'completed');
+  assert.deepEqual(calls, ['input', 'group/agent/a', 'group/agent/b', 'after', 'independent']);
+  assert.deepEqual(contexts['group/agent/a'], ['input']);
+  assert.deepEqual(contexts.independent, []);
+});
+
+test('changing one member preserves independent sibling checkpoints and pure collect resume', async () => {
+  const workflow = agentGroup(), storage = memoryStorage(), calls = [];
+  const executor = async node => { calls.push(node.id); return node.prompt ?? node.id; };
+  await core.runWorkflow({ workflow, storage, concurrency: 8, executor });
+  calls.length = 0;
+  workflow.nodes[0].agents[0].prompt = 'changed';
+  const next = await core.runWorkflow({ workflow, storage, concurrency: 8, executor });
+  assert.deepEqual(calls, ['group/agent/a', 'after']);
+  assert.equal(next.nodes['group/agent/b'].reused, true);
+  const snapshot = await storage.load(); snapshot.nodes.group.status = 'running';
+  delete snapshot.nodes.group.output; delete snapshot.nodes.group.outputHash;
+  await storage.save(snapshot);
+  calls.length = 0;
+  const resumed = await core.runWorkflow({ workflow, storage, executor });
+  assert.deepEqual(calls, []);
+  assert.equal(resumed.status, 'completed');
+  assert.deepEqual(resumed.nodes.group.output, { a: 'changed', b: 'B' });
 });
 
 test('rejects overlapping runs against the same state file', async () => {

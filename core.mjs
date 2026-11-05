@@ -64,10 +64,16 @@ export function validateWorkflow(definition) {
   }
   const nodes = new Map();
   const sourceNodes = workflow.nodes;
+  for (const node of sourceNodes) {
+    if (node && Object.hasOwn(node, 'deps') && (!Array.isArray(node.deps) || node.deps.some(id => typeof id !== 'string') || new Set(node.deps).size !== node.deps.length)) {
+      throw new TypeError(`Invalid dependencies for ${node.id}`);
+    }
+  }
   const loopIds = new Set(sourceNodes.filter(node => node && object(node) && Object.hasOwn(node, 'reviewLoop')).map(node => node.id));
   const expanded = [];
   for (const source of sourceNodes) {
     if (!source || !object(source) || !Object.hasOwn(source, 'reviewLoop')) { expanded.push(source); continue; }
+    if (Object.hasOwn(source, 'agents')) throw new TypeError(`agents and reviewLoop are mutually exclusive for ${source.id}`);
     const loop = source.reviewLoop;
     if (!object(loop)) throw new TypeError(`Invalid reviewLoop for ${source.id}`);
     const maxRounds = loop.maxRounds === undefined ? 3 : loop.maxRounds;
@@ -75,7 +81,7 @@ export function validateWorkflow(definition) {
     for (const kind of ['review', 'fix']) {
       const template = loop[kind];
       if (!object(template) || !nonempty(template.agentId) || !nonempty(template.prompt) || (Object.hasOwn(template, 'role') && !nonempty(template.role))) throw new TypeError(`Invalid ${kind} template for ${source.id}`);
-      const forbidden = ['id', 'deps', 'reviewLoop', 'reviewStep', ...(kind === 'review' ? ['schema'] : [])];
+      const forbidden = ['id', 'deps', 'reviewLoop', 'reviewStep', 'agents', 'agentStep', 'agentConcurrency', ...(kind === 'review' ? ['schema'] : [])];
       for (const field of forbidden) if (Object.hasOwn(template, field)) throw new TypeError(`Invalid ${kind} template field: ${field}`);
     }
     if (loop.review.agentId === loop.fix.agentId) throw new TypeError(`review and fix agents must be different for ${source.id}`);
@@ -97,12 +103,72 @@ export function validateWorkflow(definition) {
     delete gate.reviewLoop; delete gate.agentId; delete gate.agentTitle; delete gate.role; delete gate.rolePrompt; delete gate.roleTitle; delete gate.tools;
     expanded.push(gate);
   }
-  workflow.nodes = expanded;
+  // Expand agent groups into independent member nodes plus a pure collect gate.
+  // Keeping this in the validated DAG makes checkpoints, fingerprints and resume IDs stable.
+  const staticExpanded = [];
+  const generatedIds = new Set();
+  for (const source of expanded) {
+    if (!source || !object(source) || !Object.hasOwn(source, 'agents')) {
+      staticExpanded.push(source);
+      continue;
+    }
+    if (Object.hasOwn(source, 'agentId') || Object.hasOwn(source, 'role') || Object.hasOwn(source, 'reviewLoop') || !Array.isArray(source.agents) || source.agents.length < 1) {
+      throw new TypeError(`Invalid agent group for ${source.id}`);
+    }
+    if (Object.hasOwn(source, 'tools')) validateTools(source.tools, source.id);
+    const limit = source.agentConcurrency === undefined ? Math.min(8, source.agents.length) : source.agentConcurrency;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 8) throw new TypeError(`Invalid agentConcurrency for ${source.id}`);
+    const memberIds = new Set();
+    const memberAgents = new Set();
+    const memberNodes = [];
+    for (const agent of source.agents) {
+      if (!object(agent) || !nonempty(agent.id) || memberIds.has(agent.id) || !nonempty(agent.agentId) || !nonempty(agent.prompt) || ['deps', 'agents', 'reviewLoop', 'agentStep', 'reviewStep', 'agentConcurrency'].some(field => Object.hasOwn(agent, field))) {
+        throw new TypeError(`Invalid node agent for ${source.id}`);
+      }
+      if (memberAgents.has(agent.agentId)) throw new TypeError(`Duplicate agentId in group ${source.id}: ${agent.agentId}`);
+      memberIds.add(agent.id);
+      memberAgents.add(agent.agentId);
+      if (Object.hasOwn(source, 'schema') && Object.hasOwn(agent, 'schema') && canonical(source.schema) !== canonical(agent.schema)) {
+        throw new TypeError(`Conflicting schema for ${source.id}/${agent.id}`);
+      }
+      const memberId = `${source.id}/agent/${agent.id}`;
+      if (generatedIds.has(memberId) || expanded.some(node => node?.id === memberId)) throw new TypeError(`Generated node ID collision: ${memberId}`);
+      generatedIds.add(memberId);
+      const member = { ...source, ...agent, id: memberId, deps: [...(source.deps ?? [])], agentStep: { groupId: source.id, memberId: agent.id, kind: 'member' } };
+      delete member.agents;
+      delete member.agentConcurrency;
+      memberNodes.push(member);
+      staticExpanded.push(member);
+    }
+    const gate = { ...source, id: source.id, deps: memberNodes.map(node => node.id), agentStep: { groupId: source.id, kind: 'collect', members: [...memberIds] }, retrySafe: true };
+    delete gate.agents;
+    gate.agentConcurrency = limit;
+    delete gate.agentId;
+    delete gate.agentTitle;
+    delete gate.role;
+    delete gate.rolePrompt;
+    delete gate.roleTitle;
+    delete gate.tools;
+    delete gate.prompt;
+    staticExpanded.push(gate);
+  }
+  workflow.nodes = staticExpanded;
   for (const node of workflow.nodes) {
     if (!node || typeof node.id !== 'string' || !node.id.trim() || nodes.has(node.id)) {
       throw new TypeError('Node IDs must be nonempty and unique');
     }
     if (Object.hasOwn(node, 'tools')) validateTools(node.tools, node.id);
+    if (Object.hasOwn(node, 'agentStep')) {
+      const step = node.agentStep;
+      if (!object(step) || !nonempty(step.groupId) || !['member', 'collect'].includes(step.kind) || Object.hasOwn(node, 'reviewStep')) throw new TypeError(`Invalid agentStep for ${node.id}`);
+      if (step.kind === 'member') {
+        if (!nonempty(step.memberId) || node.id !== `${step.groupId}/agent/${step.memberId}` || !nonempty(node.agentId)) throw new TypeError(`Invalid agentStep member for ${node.id}`);
+      } else if (node.id !== step.groupId || !Array.isArray(step.members) || !step.members.length || step.members.some(id => !nonempty(id)) || new Set(step.members).size !== step.members.length || !Number.isSafeInteger(node.agentConcurrency) || node.agentConcurrency < 1 || node.agentConcurrency > 8 || node.agentId !== undefined || node.retrySafe !== true) {
+        throw new TypeError(`Invalid agentStep collect or agentConcurrency for ${node.id}`);
+      }
+    } else if (Object.hasOwn(node, 'agentConcurrency')) {
+      throw new TypeError(`agentConcurrency requires an agent group: ${node.id}`);
+    }
     if (Object.hasOwn(node, 'role')) {
       if (!nonempty(node.role) || !workflow.roles || !Object.hasOwn(workflow.roles, node.role)) {
         throw new TypeError(`Unknown role for ${node.id}: ${node.role}`);
@@ -136,13 +202,39 @@ export function validateWorkflow(definition) {
     remaining.delete(next.id);
   }
   const preceding = new Map();
-  for (const node of ordered) {
+  for (const node of logicalGroups(workflow.nodes).flatMap(group => ordered.filter(node => logicalId(node) === group.id))) {
     if (!Object.hasOwn(node, 'agentId')) continue;
     const previous = preceding.get(node.agentId);
     if (previous !== undefined && !node.deps.includes(previous)) node.deps.push(previous);
     preceding.set(node.agentId, node.id);
   }
   return workflow;
+}
+
+const logicalId = node => node.agentStep?.groupId ?? node.reviewStep?.loopId ?? node.id;
+
+// Scheduling order is separate from dependency edges: unrelated work must not
+// affect prompts, cache fingerprints or failure propagation.
+function logicalGroups(nodes) {
+  const byId = new Map(nodes.map(node => [node.id, node]));
+  const groups = new Map();
+  for (const node of nodes) {
+    const id = logicalId(node);
+    if (!groups.has(id)) groups.set(id, { id, nodes: [], deps: new Set() });
+    groups.get(id).nodes.push(node);
+    for (const dep of node.deps) {
+      const depGroup = logicalId(byId.get(dep));
+      if (depGroup !== id) groups.get(id).deps.add(depGroup);
+    }
+  }
+  const remaining = new Map(groups), ordered = [];
+  while (remaining.size) {
+    const next = [...remaining.values()].find(group => [...group.deps].every(dep => !remaining.has(dep)));
+    if (!next) throw new Error('Dependency cycle between logical nodes');
+    ordered.push(next);
+    remaining.delete(next.id);
+  }
+  return ordered;
 }
 
 function reviewReport(value) {
@@ -250,7 +342,10 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
       await save();
       try {
         const step = node.reviewStep;
-        if (step?.kind === 'gate') {
+        if (node.agentStep?.kind === 'collect') {
+          const output = Object.fromEntries(node.agentStep.members.map(memberId => [memberId, copy(dependencies[`${id}/agent/${memberId}`])]));
+          state.nodes[id] = { status: 'completed', fingerprint, reused: false, output, outputHash: hash(output) };
+        } else if (step?.kind === 'gate') {
           const report = copy(dependencies[step.reviewNodeId]);
           const failed = report?.verdict !== 'approved';
           state.nodes[id] = { status: failed ? 'failed' : 'completed', fingerprint, reused: false, output: report, outputHash: hash(report), ...(failed ? { error: `Review limit ${step.maxRounds} reached: changes-required` } : {}) };
@@ -272,24 +367,30 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
       await save();
     }
     try {
-      while (pending.size || running.size) {
-        if (!signal.aborted) {
-          for (const [id, node] of pending) {
-            if (running.size >= concurrency) break;
-            if (node.deps.some(dep => ['failed', 'blocked', 'needs_review'].includes(state.nodes[dep].status))) {
-              state.nodes[id] = { status: 'blocked' };
+      for (const group of logicalGroups(workflow.nodes)) {
+        const gate = group.nodes.find(node => node.agentStep?.kind === 'collect');
+        const limit = gate ? Math.min(concurrency, gate.agentConcurrency) : 1;
+        while (group.nodes.some(node => pending.has(node.id)) || running.size) {
+          if (!signal.aborted) {
+            for (const node of group.nodes) {
+              const id = node.id;
+              if (!pending.has(id)) continue;
+              if (node.deps.some(dep => ['failed', 'blocked', 'needs_review'].includes(state.nodes[dep].status))) {
+                state.nodes[id] = { status: 'blocked' };
+                pending.delete(id);
+                continue;
+              }
+              if (running.size >= limit) continue;
+              if (!node.deps.every(dep => state.nodes[dep].status === 'completed')) continue;
               pending.delete(id);
-              continue;
+              const task = runNode(node).finally(() => running.delete(id));
+              running.set(id, task);
             }
-            if (!node.deps.every(dep => state.nodes[dep].status === 'completed')) continue;
-            pending.delete(id);
-            const task = runNode(node).finally(() => running.delete(id));
-            running.set(id, task);
           }
+          if (running.size) await Promise.race(running.values());
+          else if (signal.aborted) break;
         }
-        if (running.size) await Promise.race(running.values());
-        else if (signal.aborted) break;
-        else if (pending.size) continue; // Propagate blocking through arbitrary node order.
+        if (signal.aborted) break;
       }
     } catch (error) {
       await Promise.allSettled(running.values());

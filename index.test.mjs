@@ -931,6 +931,65 @@ test('an interrupted Agent checkpoint with a changed fingerprint still requires 
   assert.equal(f.native.continuations.length, 0);
 });
 
+test('grouped agents preserve individual capsule identities and expose a collection without an Agent', async t => {
+  const f = await fixture(t, async prompt => ({ task: prompt.split('\n')[0] }), undefined, { native: true });
+  await f.write({ id: 'grouped-host', agents: { reader: { title: 'Reader' }, checker: { title: 'Checker' } }, roles: { read: { prompt: 'Read carefully', tools: [] } }, nodes: [
+    { id: 'prepare', prompt: 'Prepare' },
+    { id: 'checks', deps: ['prepare'], agentConcurrency: 2, agents: [
+      { id: 'read', agentId: 'reader', role: 'read', prompt: 'Read' },
+      { id: 'check', agentId: 'checker', prompt: 'Check' },
+    ] },
+    { id: 'finish', deps: ['checks'], agentId: 'reader', prompt: 'Finish' },
+  ] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json', concurrency: 2 });
+  const result = await finished(f, run.runId);
+  assert.equal(result.status, 'completed', result.error);
+  const reader = result.nodes['checks/agent/read'], checker = result.nodes['checks/agent/check'];
+  assert.ok(reader.agentSessionId);
+  assert.notEqual(reader.agentSessionId, checker.agentSessionId);
+  assert.equal(result.nodes.finish.agentSessionId, reader.agentSessionId);
+  assert.equal(result.nodes.checks.agentSessionId, undefined);
+  assert.equal(result.nodes.checks.agentStep.kind, 'collect');
+  assert.equal(reader.agentStep.groupId, 'checks');
+  const detail = await f.call({ action: 'status', runId: run.runId, nodeId: 'checks' });
+  assert.deepEqual(Object.keys(detail.node.output), ['read', 'check']);
+  assert.ok(f.native.policyActivations.some(policy => policy.prompt === 'Read carefully' && policy.tools.length === 0));
+  await f.unload(); await f.restart();
+  const resumed = await f.call({ action: 'resume', runId: run.runId });
+  const restored = await finished(f, resumed.runId);
+  assert.equal(restored.nodes['checks/agent/read'].agentSessionId, reader.agentSessionId);
+  assert.equal(restored.nodes.checks.reused, true);
+});
+
+test('expanded member nodes count toward the Host workflow limit', async t => {
+  const f = await fixture(t);
+  await f.write({ id: 'too-many-members', nodes: [{ id: 'check', agents: Array.from({ length: 100 }, (_, i) => ({ id: `m${i}`, agentId: `a${i}`, prompt: 'Check' })) }] });
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /exceeds 100 nodes/);
+  assert.equal(f.requests.length, 0);
+});
+
+test('messages reach the selected running member of a multi-Agent node', async t => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  const messages = [];
+  const f = await fixture(t, async () => { await held; return 'done'; }, undefined, { native: true,
+    onMessage: request => { messages.push(request); return 'member-message'; } });
+  await f.write({ id: 'member-messages', nodes: [{ id: 'check', agents: [
+    { id: 'read', agentId: 'reader', prompt: 'Read' },
+    { id: 'audit', agentId: 'auditor', prompt: 'Audit' },
+  ] }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json', concurrency: 2 });
+  try {
+    while (f.requests.length < 2) await new Promise(resolve => setTimeout(resolve, 1));
+    const state = await f.call({ action: 'status', runId: run.runId });
+    const sent = await f.call({ action: 'message', runId: run.runId, nodeId: 'check/agent/audit', message: 'Check the new evidence' });
+    assert.equal(sent.accepted, true);
+    assert.equal(messages[0].childId, state.nodes['check/agent/audit'].agentSessionId);
+    assert.notEqual(messages[0].childId, state.nodes['check/agent/read'].agentSessionId);
+  } finally { release(); }
+  assert.equal((await finished(f, run.runId)).status, 'completed');
+});
+
 test('treats null agent results as failures and never executes input as JavaScript', async t => {
   const f = await fixture(t, async prompt => { assert.match(prompt, /globalThis/); return null; });
   await f.write({ id: 'flow', nodes: [{ id: 'a', input: 'globalThis.compromised = true; ${evil}' }] });

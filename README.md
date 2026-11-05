@@ -2,7 +2,9 @@
 
 简体中文 | [English](README.en.md)
 
-在 Harness 中运行 JSON 工作流，查看阶段进度和节点结果，选择子 Agent 模型，并在继续执行时复用有效的已完成结果。同一个胶囊代理可以跨阶段保留 Agent 会话和历史，每个阶段使用对应的角色提示词和工具策略。
+在 Harness 中运行 JSON 工作流。逻辑节点严格串行，同一节点内的多个 Agent 可以并行，完成结果可持久化并复用。同一个胶囊代理可以跨阶段保留 Agent 会话和历史，每个阶段使用对应的角色提示词和工具策略。
+
+本文描述当前源码的工作流契约，不表示已安装的 live 插件或已发布版本已更新。
 
 ## 安装
 
@@ -51,7 +53,7 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 
 1. 点击会话右上角的「工作流」，打开详情面板。
 2. 打开「运行配置」，填写「工作流文件路径」。可以输入 `dynamic-workflow/workflow.example.json` 运行附带示例。
-3. 选择「子 Agent 模型」和「最多同时运行」的数量，再点击「运行工作流」。模型列表来自 Harness 当前配置。
+3. 选择「子 Agent 模型」和节点内同时运行的 Agent 数量上限，再点击「运行工作流」。模型列表来自 Harness 当前配置。
 4. 在「运行记录」中选择本次运行，查看阶段进度。点击代理行查看节点结果，或点击「查看工作流定义」核对任务。
 5. 需要换模型时，选择新模型并点击「切换模型并继续」。具体恢复规则见下一节。
 
@@ -117,9 +119,38 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 
 `id` 是工作流的稳定标识。`nodes` 是节点数组，节点 `id` 必须唯一。`deps` 填写前置节点的 `id`。节点可以指定 `provider`、`model` 和结构化输出 `schema`；省略模型时使用运行或会话配置。前置节点的结果会以 JSON 数据传给后继节点。
 
+## 串行节点与节点内多 Agent
+
+节点按稳定拓扑顺序逐个运行；拓扑关系相同时保留定义中的顺序。当前节点结束后，才处理下一个节点。串行调度不会给无关节点添加 `deps`：失败只阻塞依赖它的后续节点，独立节点仍可继续运行。
+
+多 Agent 节点使用 `agents` 数组，采用 collect 模式：
+
+```json
+{
+  "id": "analyze",
+  "agentConcurrency": 2,
+  "agents": [
+    { "id": "plan", "agentId": "planner", "prompt": "提出方案。", "tools": [] },
+    { "id": "risk", "agentId": "reviewer", "prompt": "列出风险。", "tools": [] }
+  ]
+}
+```
+
+每个成员的 `id` 在节点内唯一，`agentId` 引用顶层 `agents` 中的稳定身份，`prompt` 指定任务。可选 `role` 引用顶层角色；成员还可指定 `tools`、`provider`、`model`、`schema` 和 `retrySafe`。`agentConcurrency` 是 1 至 8 的整数，默认值为 `min(8, 成员数量)`，仍受运行并发上限限制。
+
+Host 将成员静态展开为 `analyze/agent/plan`、`analyze/agent/risk`。原 `analyze` 节点保留为 collect 汇总门禁，等待全部成员成功，再按成员 `id` 输出对象，例如 `{"plan":"方案结果","risk":"风险结果"}`。后续节点依赖 `analyze` 即可取得汇总结果。成员结果分别持久化，恢复时可复用已成功且有效的成员结果。向活跃成员发送 `message` 时，使用 `status` 返回的内部成员节点 ID，例如 `analyze/agent/plan`。
+
+[多 Agent 示例](workflow.multi-agent.example.json) 先并行收集两份分析，再串行交付。所有角色和成员均使用空工具列表。通过 `dynamic_workflow` 工具传入以下参数，显式允许两个成员并行：
+
+```json
+{"action":"run","workflowPath":"dynamic-workflow/workflow.multi-agent.example.json","concurrency":2}
+```
+
+也可以使用 `/workflow` 加上述 JSON 参数。仅运行文件路径时默认并发为 1；文件中的 `agentConcurrency: 2` 不会提高运行上限。
+
 ## 胶囊代理与阶段角色
 
-每个胶囊代表一个 Agent。`agents` 定义稳定代理，节点的 `agentId` 绑定该身份；相同 `agentId` 的阶段共用同一个原生 Agent 会话 ID、消息历史和工具结果。不同代理可以并行；同一代理的阶段按 DAG 的稳定拓扑顺序串行执行，即使省略前后阶段之间的依赖也不会并发唤醒它。
+每个胶囊代表一个 Agent。顶层 `agents` 定义稳定代理，节点或节点成员的 `agentId` 绑定该身份；相同 `agentId` 的阶段共用同一个原生 Agent 会话 ID、消息历史和工具结果。所有逻辑节点按稳定拓扑顺序逐个运行；并行仅发生在同一多 Agent 节点内。同一代理始终串行激活。
 
 `roles` 定义阶段角色。每个角色包含 `prompt`，可选 `title` 和 `tools`。节点用 `role` 引用角色；执行器在每次唤醒 Agent 前安装当前角色的系统提示词与工具策略，结束后清理，再为下一阶段安装新角色。切换角色保留历史，旧提示词仍可能作为历史上下文存在。胶囊显示当前角色，头像颜色和悬浮信息对应稳定代理。
 
@@ -199,7 +230,7 @@ Host 在运行前静态展开为 `${id}/review/1`、`${id}/fix/1` 等内部节�
 | `stop` | `runId` | 取消执行并等待子 Agent 清理 |
 | `list` | 无 | 查询当前会话的运行历史 |
 
-`concurrency` 的范围是 1–8。`run` 默认使用 1；`resume` 沿用原运行的值，除非显式指定。模型值应使用实际模型列表中的标识，不要将「会话当前模型」等界面文案当成模型标识。
+`concurrency` 是当前节点内同时运行的 Agent 数量上限，范围为 1 至 8，不再控制顶层节点并发。`run` 默认使用 1；`resume` 沿用原运行的值，除非显式指定。节点的 `agentConcurrency` 可以进一步降低上限，实际并发不超过两者的较小值。工作流 JSON 不支持顶层 `concurrency`；请通过工具调用或 `/workflow` JSON 参数传入。模型值应使用实际模型列表中的标识，不要将「会话当前模型」等界面文案当成模型标识。
 
 ## 持久化与限制
 
