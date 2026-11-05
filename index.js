@@ -226,6 +226,27 @@ export async function apply(ctx, config = {}) {
       } catch (error) { return { kind: 'error', text: error instanceof Error ? error.message : String(error) }; }
     },
   }));
+  // Connection authenticates these exact Fetch routes and admits owner peers only.
+  // Background UI reads must not pass through commands.execute: it logs every call.
+  ctx.inject?.(['connection', 'sessionController'], scope => {
+    const json = (value, status = 200) => Response.json(value, { status, headers: { 'cache-control': 'no-store' } });
+    scope.effect(() => scope.connection.fetch.register({
+      path: '/api/dynamic-workflow/read', methods: ['GET'], requestBody: 'buffered',
+      async fetch(request) {
+        try {
+          const url = new URL(request.url);
+          const sessionId = url.searchParams.get('sessionId');
+          const args = JSON.parse(url.searchParams.get('args') || '{}');
+          if (!sessionId || !['list', 'status'].includes(args?.action)) return json({ error: 'A session and read-only action (list/status) are required' }, 400);
+          request.signal.throwIfAborted();
+          const resolved = await scope.sessionController.resolveAgent(sessionId);
+          if (resolved.error) return json({ error: resolved.error.message }, resolved.error.code === 'session/not-found' ? 404 : 409);
+          request.signal.throwIfAborted();
+          return json(await execute(args, { agent: resolved.agent, signal: request.signal }));
+        } catch (error) { return json({ error: error instanceof Error ? error.message : String(error) }, 400); }
+      },
+    }));
+  });
   const locks = new Set();
   async function execute(args, exec, resumeSource, revision = false) {
       if (closed) throw new Error('Plugin is unloading');

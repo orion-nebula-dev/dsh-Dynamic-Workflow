@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import vm from 'node:vm';
 
-async function fixture(hooks = {}, remote = {}) {
+async function fixture(hooks = {}, remote = {}, globals = {}) {
   let plugin;
   const registrations = [];
   const React = {
@@ -12,7 +12,7 @@ async function fixture(hooks = {}, remote = {}) {
     useCallback: callback => callback, useEffect() {}, ...hooks,
   };
   const source = await readFile(new URL('./client.js', import.meta.url), 'utf8');
-  vm.runInNewContext(source, { window: { __ModuleLoader__: { load(definition) {
+  vm.runInNewContext(source, { AbortController, ...globals, window: { __ModuleLoader__: { load(definition) {
     plugin = definition.factory(name => { assert.equal(name, 'react'); return React; });
   } } } });
   plugin.apply({ remote, effect: setup => setup(), locale: { register: () => () => {} },
@@ -148,6 +148,59 @@ for (const failure of ['rejected', 'thrown']) test(`global mode reports ${failur
 
 // The hook adapter checks first-render and native tool-result compatibility.
 // Actual placement, appearance and controls are verified in the real browser.
+test('background workflow refresh reads state without executing a logged session command', async () => {
+  const effects = [], states = []; let cursor = 0, commandCalls = 0, reads = 0;
+  const history = { runs: [{ runId: 'run-1', status: 'running', createdAt: 1 }] };
+  const remote = { commands: { execute: async () => {
+    commandCalls++;
+    return { ok: true, value: { result: { kind: 'success', text: JSON.stringify(history) } } };
+  } } };
+  const globals = { fetch: async () => { reads++; return { ok: true, json: async () => history }; } };
+  const registrations = await fixture({
+    useState(initial) { const index = cursor++; if (!(index in states)) states[index] = initial; return [states[index], value => { states[index] = typeof value === 'function' ? value(states[index]) : value; }]; },
+    useEffect(setup) { effects.push(setup); },
+  }, remote, globals);
+  const registration = registrations.find(item => item.options.name === 'conversation.session.header.utilities');
+  const wrapper = registration.component({ t: key => key, ...registration.options.inject('parent-session') });
+  wrapper.type(wrapper.props);
+  const cleanup = effects[0]();
+  effects[1]();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(commandCalls, 0, 'automatic reads must not create command events');
+  assert.equal(reads, 1);
+  assert.equal(states[1][0].runId, 'run-1');
+  cleanup();
+});
+
+test('detail and node reads stay quiet while an explicit stop still executes a command', async () => {
+  const effects = [], queries = [], commands = []; let cursor = 0;
+  const run = { runId: 'run-1', status: 'running', nodes: { one: { status: 'completed' } } };
+  const remote = { commands: { execute: async (_id, line) => {
+    commands.push(JSON.parse(line.slice('/workflow '.length)));
+    return { ok: true, value: { result: { kind: 'success', text: JSON.stringify(run) } } };
+  } } };
+  const registrations = await fixture({
+    useState(initial) { return [cursor++ === 0 ? true : initial, () => {}]; },
+    useEffect(setup) { effects.push(setup); },
+  }, remote, { fetch: async path => {
+    queries.push(JSON.parse(new URL(path, 'http://localhost').searchParams.get('args')));
+    return { ok: true, json: async () => queries.at(-1).action === 'list' ? { runs: [run] } : run };
+  } });
+  const registration = registrations.find(item => item.options.name === 'conversation.session.header.utilities');
+  const wrapper = registration.component({ t: key => key, ...registration.options.inject('parent-session') });
+  const tree = wrapper.type({ ...wrapper.props, initialRun: run, placement: 'inline' });
+  const cleanup = effects[0]();
+  effects[6]();
+  await new Promise(resolve => setImmediate(resolve));
+  await elements(tree, item => item.type === 'button' && item.props.className === 'dwf-agent')[0].props.onClick();
+  assert.deepEqual(queries, [{ action: 'status', runId: 'run-1' }, { action: 'status', runId: 'run-1', nodeId: 'one' }]);
+  assert.equal(commands.length, 0);
+  await elements(tree, item => item.type === 'button' && item.props.title === 'stop')[0].props.onClick();
+  assert.deepEqual(commands, [{ action: 'stop', runId: 'run-1' }]);
+  assert.deepEqual(queries.at(-1), { action: 'list' });
+  cleanup();
+});
+
 test('the header launcher renders before history or details have loaded', async () => {
   const registrations = await fixture();
   assert.ok(!registrations.some(item => item.options.name === 'conversation.input.dock'));

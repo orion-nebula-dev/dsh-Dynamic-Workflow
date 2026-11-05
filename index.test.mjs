@@ -31,7 +31,7 @@ function durableStore() {
 
 async function fixture(t, execute = async prompt => ({ prompt }), onDispose = async () => {}, options = {}) {
   const root = await mkdtemp(join(tmpdir(), 'dynamic-workflow-test-'));
-  const effects = []; let tool; let command; const requests = []; let disposed = 0;
+  const effects = []; let tool; let command; let readRoute; const requests = []; let disposed = 0;
   const listeners = new Map(), catalog = new Map(), histories = new Map(), live = new Map(), continuations = [];
   function on(name, handler) { if (!listeners.has(name)) listeners.set(name, new Set()); listeners.get(name).add(handler); return () => listeners.get(name).delete(handler); }
   async function emit(name, ...args) { for (const handler of [...(listeners.get(name) || [])]) await handler(...args); }
@@ -121,17 +121,49 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
   const owner = { id: 'owner', ctx: { get: key => services[key] } };
   const storageDomain = durableStore();
   const ctx = { storageDomain, commands: { register(value) { command = value; return () => { command = undefined; }; } }, tools: { register(value) { tool = value; return () => { tool = undefined; }; } }, effect(fn) { const off = fn(); effects.push(off); return off; }, ...(options.settings ? { settings: options.settings } : {}), ...(options.native ? { on } : {}) };
+  ctx.inject = (_keys, setup) => {
+    if (!options.readTransport) return;
+    setup({ effect: ctx.effect,
+      connection: { fetch: { register(route) { readRoute = route; return async () => { readRoute = undefined; }; } } },
+      sessionController: { async resolveAgent(id) {
+        if (id === 'missing') return { error: { code: 'session/not-found', message: 'Session not found' } };
+        return { agent: id === owner.id ? owner : { ...owner, id } };
+      } },
+    });
+  };
   const module = await import('./index.js').catch(error => error.code === 'ERR_MODULE_NOT_FOUND' ? {} : Promise.reject(error));
   assert.equal(typeof module.apply, 'function', 'Host plugin must export apply');
   await module.apply(ctx, options.config);
   t.after(async () => { for (const effect of effects.reverse()) await effect?.(); await rm(root, { recursive: true, force: true }); });
   return { root, owner, requests, storageDomain, services, native: { catalog, histories, continuations, live, policyActivations }, restart: () => module.apply(ctx), get disposed() { return disposed; },
-    get command() { return command; }, listeners,
+    get command() { return command; }, get readRoute() { return readRoute; }, listeners,
     write: workflow => writeFile(join(root, 'flow.json'), JSON.stringify(workflow)),
     call: (args, agent = owner, signal = new AbortController().signal) => tool.execute(args, { agent, signal }),
     unload: async () => { for (const effect of effects.splice(0).reverse()) await effect?.(); },
   };
 }
+test('quiet UI reads share workflow state, enforce session ownership, and reject mutations', async t => {
+  const f = await fixture(t, undefined, undefined, { readTransport: true });
+  assert.ok(f.readRoute, 'register a read route on the authenticated Connection carrier');
+  assert.deepEqual(f.readRoute.methods, ['GET']);
+  const read = (sessionId, args) => f.readRoute.fetch(new Request(`http://localhost${f.readRoute.path}?sessionId=${sessionId}&args=${encodeURIComponent(JSON.stringify(args))}`));
+  const empty = await read('owner', { action: 'list' });
+  assert.deepEqual(await empty.json(), { runs: [] });
+  assert.equal(empty.headers.get('cache-control'), 'no-store');
+  await f.write({ id: 'quiet-read', nodes: [{ id: 'one', prompt: 'hello' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  const own = await read('owner', { action: 'status', runId: run.runId });
+  assert.equal(own.status, 200);
+  assert.equal((await own.json()).runId, run.runId);
+  const other = await read('other-owner', { action: 'list' });
+  assert.deepEqual(await other.json(), { runs: [] });
+  assert.notEqual((await read('other-owner', { action: 'status', runId: run.runId })).status, 200);
+  assert.equal((await read('missing', { action: 'list' })).status, 404);
+  assert.equal((await read('owner', { action: 'stop', runId: run.runId })).status, 400);
+  await f.unload();
+  assert.equal(f.readRoute, undefined, 'dispose the route with the plugin');
+});
+
 test('global router reads a live setting and ignores its own instructions', async t => {
   let enabled = false, calls = 0;
   const setting = { get: () => enabled };

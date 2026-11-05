@@ -1,4 +1,4 @@
-/* Dynamic Workflow: session controls share the Host command with the agent tool. */
+/* Dynamic Workflow: quiet state reads; user operations share the Host command with the agent tool. */
 window.__ModuleLoader__.load({
   id: '@local/dynamic-workflow',
   factory(require) {
@@ -93,6 +93,12 @@ window.__ModuleLoader__.load({
         const controller = new AbortController();
         pending.current.add(controller);
         try {
+          if (args.action === 'list' || args.action === 'status') {
+            const response = await fetch(`/api/dynamic-workflow/read?sessionId=${encodeURIComponent(sessionId)}&args=${encodeURIComponent(JSON.stringify(args))}`, { credentials: 'same-origin', signal: controller.signal });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || `Workflow query failed (${response.status})`);
+            return data;
+          }
           const response = await remote.commands.execute(sessionId, `/workflow ${JSON.stringify(args)}`, [], controller.signal);
           if (!response.ok) throw response.error;
           if (!response.value) throw new Error(t('unknownCommand'));
