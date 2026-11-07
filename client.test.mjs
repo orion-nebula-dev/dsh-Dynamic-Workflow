@@ -211,7 +211,7 @@ test('the header launcher renders before history or details have loaded', async 
   assert.equal(rendered.props['aria-label'], 'title');
 });
 
-for (const action of ['run', 'resume']) test(`${action} results bind an inline card to their original run`, async () => {
+for (const action of ['run', 'resume', 'revise']) test(`${action} results bind an inline card to their original run`, async () => {
   const registrations = await fixture();
   const registration = registrations.find(item => item.options.name === 'conversation.chat.node');
   const run = { runId: 'saved-run', workflowPath: '/tmp/workflow.json', status: 'running', title: 'Actual workflow', nodes: { plan: { status: 'running', agentTitle: 'Designer' } } };

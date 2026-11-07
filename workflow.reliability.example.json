@@ -1,0 +1,61 @@
+{
+  "id": "reliability-example-v1",
+  "title": "Bounded text analysis",
+  "inputFiles": [
+    "dynamic-workflow/workflow-input.example.txt"
+  ],
+  "nodes": [
+    {
+      "id": "decision",
+      "prompt": "Return exactly the text yes.",
+      "tools": [],
+      "retrySafe": true,
+      "timeoutMs": 30000,
+      "maxRetries": 1,
+      "writeResources": []
+    },
+    {
+      "id": "analysis",
+      "deps": [
+        "decision"
+      ],
+      "condition": {
+        "dependency": "decision",
+        "equals": "yes"
+      },
+      "agentConcurrency": 2,
+      "agents": [
+        {
+          "id": "plan",
+          "agentId": "planner",
+          "prompt": "Draft a short factual plan using only supplied instructions.",
+          "tools": [],
+          "retrySafe": true,
+          "timeoutMs": 30000,
+          "maxRetries": 1,
+          "writeResources": []
+        },
+        {
+          "id": "checks",
+          "agentId": "checker",
+          "prompt": "List two observable verification steps.",
+          "tools": [],
+          "retrySafe": true,
+          "timeoutMs": 30000,
+          "writeResources": []
+        }
+      ]
+    },
+    {
+      "id": "deliver",
+      "deps": [
+        "analysis"
+      ],
+      "prompt": "Combine the collected member results. Explain if analysis was skipped.",
+      "tools": [],
+      "retrySafe": true,
+      "timeoutMs": 30000,
+      "writeResources": []
+    }
+  ]
+}

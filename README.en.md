@@ -27,7 +27,7 @@ Enter commands in the session input box. `/workflow` alone shows command help; i
 | `/workflow list` | List runs in the current session |
 | `/workflow status <runId>` | Inspect a run's status |
 | `/workflow resume <runId>` | Continue from the saved definition and progress |
-| `/workflow revise <JSON>` | Stop the old run, load a new definition, and reuse compatible results |
+| `/workflow revise <runId>` | Continue the saved definition; new JSON requires the JSON command below |
 | `/workflow stop <runId>` | Cancel execution and wait for child Agent cleanup |
 | `/workflow models` | List currently available executor models |
 
@@ -253,3 +253,44 @@ When `status` includes `nodeId`, its `agent` field reports the model used by tha
 Workflow files are limited to 1 MiB and 100 nodes after Host expansion. Node details truncate long display content. Cache validity depends on the workflow definition and dependency results. When external material used by a task changes, the assistant should update the relevant inputs to avoid reusing stale results.
 
 Stages are displayed by node. Dependencies include both explicit `deps` and implicit preceding stages of a shared Agent. Each activation reinstalls the stage role and tool policy, including before restoring the original Agent session after a restart.
+
+
+## Local 0.5.2 reliability contract
+
+This source/package version is 0.5.2; the bundled patch still selects `@local/dynamic-workflow`. Supported Harness range remains `>=0.2.1-rc.5 <0.3.0-0`. Version 0.5.1 is installed on a live host and has passed acceptance; 0.5.2 changes documentation and tool-description strings only, not the guard implementation, so it was not reinstalled. No GitHub Release is implied. The original licensing state is unchanged; this work adds no license grant.
+
+A revision using a new file must supply both fields:
+
+```text
+/workflow {"action":"revise","runId":"<runId>","workflowPath":"new.json","revisionReason":"changed acceptance criteria"}
+/workflow revise <runId>
+/workflow archive <runId>
+/workflow archive-read <runId>
+/workflow restore <runId>
+```
+
+The UI's **Revise from file** action sends `runId` and the entered `workflowPath`. Resume and shorthand revise use the saved definition even if its original file was edited. Inputs are refreshed in all cases.
+
+- `inputFiles`: explicit local paths, at most 16 unique entries, 1 MiB each and 4 MiB total. Paths resolve against the current parent session working directory (not the workflow directory). Every run/resume/revise reads through parent `fs.resolve/readBytes`; absent, denied or oversized inputs fail admission. A backend without bounded `readBytes` rejects this feature. Hashes and canonical target identities enter every node fingerprint; file contents are not automatically appended to model prompts. No URL fetching or implicit file discovery occurs.
+- A changed external input invalidates ordinary cache reuse. Changed executed capsule definitions or inputs retain original child IDs and enter `needs_review`; inspect actual external effects before intentionally selecting a new workflow identity. Hashing observes the file at admission time and does not freeze subsequent file changes.
+- `timeoutMs`: integer 1–3600000, default 600000 per attempt. `maxRetries`: integer 0–3, default 0; positive values require explicit `retrySafe:true`. Timeouts abort the executor, then await actual settlement/disposal before retry or successor admission. A non-cooperative executor can therefore hold admission indefinitely. Cleanup failures require review and quarantine capsule claims until host teardown is verified. Locks cover this plugin process; they are not distributed OS locks.
+- `condition:{"dependency":"decision","equals":"yes"}`: exact JSON equality against a declared dependency output. False conditions finish with `skipped:true, output:null`. There is no eval, code expression, or property traversal. Human `approval`/`humanApproval` declarations are rejected: tool/model input does not prove human-source approval authority. Review verdicts are model review results, not human permissions.
+- `writeResources`: unique logical resource names shared by cooperating writers, e.g. `["report"]`, `["workspace:repo"]`; overlapping names serialize members. Omitted declarations mean `["*"]`, conflicting with all writers. `[]` explicitly declares no shared writes. These declarations coordinate scheduling; they do not enforce filesystem paths, isolate working directories, or make Bash read-only. Use the same resource label for all writers of a shared target. Top-level stages stay serial; pure collect and bounded review semantics remain.
+- Role tool guards check actual host execution names, including nested calls with parent tokens. Reserved top-level `run_code` is transport, never a grant to nested `run_code`, Bash or wrappers. **Under an empty tool policy (`tools: []`) that top-level `run_code` transport is itself disabled**: the child can only return text, and the host rejects calls with "Tool is unavailable in this workflow activation". Omitting `tools` inherits the parent toolset and behaves differently from an empty array. An explicitly allowed powerful tool can perform its own effects; this plugin is not an OS sandbox.
+- Each newly executed operation has a stable `operationId` in activation prompts, snapshots/checkpoints and status. Failed non-retry-safe nodes need verified original child history or manual review. Continuation is not exactly-once execution: reconcile real external state/receipts before repeating effects. Receipt text supplied by a model is not independently verified by this plugin.
+- Global classification uses the session model, a trusted system instruction and JSON-quoted user text, minimal active-run context, a 10 second deadline independent of iterator abort compliance, 256 requested output tokens, 8192 received characters and 1024 chunks. Invalid/upstream failures provide readable direct-handling diagnostics. No revise is selected without an active run; status/progress questions continue directly. Each human message ID is claimed before classification across repeated hooks/retries in the loaded adapter.
+- `list` returns the newest 100 unarchived owner-scoped previews. Archive is explicit and reversible: eligible plugin records are gzip-compressed with checksum/readback verification (32 MiB uncompressed limit), removed from ordinary previews and restored on request. Running, interrupted, needs_review records and resume ancestors are protected. Archive never deletes host sessions. Compressed archives and host history still grow; there is no global disk quota or automatic history retention/deletion. Restore an archive before resuming it.
+
+Run the [reliability example](workflow.reliability.example.json) from the parent workspace containing the `dynamic-workflow` directory; adjust its one explicit input path if the checkout has a different name. The sample uses text-only roles, declares no writes and exercises a condition, bounded retry/timeouts and parallel collection. A real model may return text other than exactly `yes`, in which case analysis is intentionally skipped.
+
+
+### Archive discovery and downgrade
+
+`/workflow archive-preview <runId>` is read-only: reports the exact owner/run scope, status, eligibility/protected reason and current serialized plugin-record `storageBytes` (not host backend disk allocation). Discover archives with `/workflow {"action":"list","includeArchived":true,"offset":0}`; results include `isArchived`, `archivedAt`, `total` and `nextOffset` for pages of 100. Pass the returned nextOffset to list later pages. `includeArchived` must be boolean and is valid only for list; `offset` must be a nonnegative integer for list only. Preview/read/restore require a runId owned by the current session. Compressed payload count and total storage remain unbounded; preview pagination does not implement retention.
+
+Operation IDs persist only while the node fingerprint is unchanged (including retry/continuation); revised independent inputs/definitions get a new ID. Cleanup uncertainty closes all future workflow admission, blocks unstarted nodes, drains running siblings and keeps target/capsule claims quarantined.
+
+0.5.0 introduced optional persisted operationId, inputDigests, archivedAt, archivePayload and archiveHash fields, including checkpoint operationId. Old 0.4.0 strict schemas cannot read these newer records. Downgrade requires restoring the matching preinstallation plugin-state backup together with the old plugin; Ops owns live backups and must preserve user sessions. Live rollback has not been tested here.
+
+
+A new `run` also refuses admission when the selected prior record for the same owner and canonical file path is archived. First use `/workflow restore <priorRunId>`, then run the file. This conservative rule applies even if the file now declares a new workflow ID: restore the prior record first. Archive/read/restore preserve failed-operation history and completed capsule identities; archiving never authorizes a fresh execution.

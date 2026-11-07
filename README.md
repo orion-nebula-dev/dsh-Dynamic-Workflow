@@ -27,7 +27,7 @@ git clone https://github.com/orion-nebula-dev/dsh-Dynamic-Workflow.git dynamic-w
 | `/workflow list` | 查看当前会话的运行记录和 `runId` |
 | `/workflow status <runId>` | 查看阶段进度和节点状态 |
 | `/workflow resume <runId>` | 使用保存的定义和进度继续执行 |
-| `/workflow revise <JSON>` | 停止旧运行，读取新定义并按条件复用结果 |
+| `/workflow revise <runId>` | 使用保存的定义；读取新 JSON 须使用下方 JSON 命令 |
 | `/workflow stop <runId>` | 停止运行并等待子 Agent 清理 |
 | `/workflow models` | 查看可用模型的 `provider` 和 `model` 标识 |
 
@@ -241,3 +241,42 @@ Host 在运行前静态展开为 `${id}/review/1`、`${id}/fix/1` 等内部节�
 工作流文件最多 1 MiB，Host 展开后最多 100 个节点。节点详情会截断较长的展示内容。缓存根据工作流定义和依赖结果判断是否有效；任务依赖的外部资料变化时，应由助手更新相应输入，避免复用过期结果。
 
 阶段按节点展示；依赖关系包含节点的 `deps` 和共享代理的隐式前置阶段。每次激活会重新安装阶段角色与工具策略，重启后也会在原 Agent 会话恢复前安装。
+
+
+## 本地 0.5.2 可靠性约定
+
+本地包版本为 0.5.2，补丁仍引用 `@local/dynamic-workflow`，支持的 DSH 范围保持 `>=0.2.1-rc.5 <0.3.0-0`。0.5.1 已装入运行主机并通过验收；0.5.2 只改文档与工具描述字符串，不改守卫实现，故未重新安装。本版本不代表 GitHub Release。保留原许可状态，不新增开源许可。
+
+读取新定义必须同时提供 `runId` 和 `workflowPath`；界面的「读取新定义并修订」按钮使用同一参数。仅提供 `runId` 时使用保存的定义。
+
+```text
+/workflow {"action":"revise","runId":"<runId>","workflowPath":"new.json","revisionReason":"验收标准变化"}
+/workflow revise <runId>
+/workflow archive <runId>
+/workflow archive-read <runId>
+/workflow restore <runId>
+```
+
+- `inputFiles` 仅接受显式本地路径，最多 16 个，每个不超过 1 MiB，合计不超过 4 MiB。相对路径基于父会话当前工作目录。每次运行、继续和修订均经父会话 `fs.resolve/readBytes` 重新读取并计算哈希；文件删除、拒绝访问或超限时拒绝启动。不扫描目录、不抓取 URL。缺少有界 `readBytes` 的后端不支持此功能。只向提示词提供路径和哈希，不自动插入文件正文；读取时的哈希不能冻结后续文件变化。
+- 普通节点的外部输入变化会使缓存失效。已执行胶囊的定义或输入变化会保留原子会话 ID，并进入 `needs_review`。先核实外部操作状态，再决定是否使用新的工作流 ID。
+- `timeoutMs` 为 1–3600000 的整数，默认每次尝试 600000 毫秒。`maxRetries` 为 0–3 的整数，默认 0；自动重试要求显式 `retrySafe:true`。超时先中止，再等待执行器和子会话清理结束，之后才允许重试或下个写入者。执行器不响应中止时，等待可能持续。清理失败进入待核查，相关胶囊锁继续保留。锁仅覆盖当前插件进程，不是分布式锁。
+- `condition:{"dependency":"decision","equals":"yes"}` 对已声明依赖的完整输出执行 JSON 相等比较。不满足时记录 `skipped:true, output:null`。不支持代码表达式或属性遍历。`approval` 和 `humanApproval` 声明会被拒绝，因为模型或工具参数不能证明真实人类批准；模型审查结果也不作为人类权限依据。
+- `writeResources` 声明协作写入者共享的资源名称，例如 `["report"]`。同名资源串行执行；省略表示 `["*"]`，与其他写入者冲突；`[]` 表示声明无共享写入。资源名称须由使用者一致标记；此机制不强制文件路径、不隔离工作目录，也不使 Bash 只读。顶层阶段仍串行，成员可并行收集，审查轮次保持有界。
+- 工具守卫检查宿主实际调用名称及嵌套调用。顶层 `run_code` 仅为传输入口，不能授权嵌套 `run_code`、Bash 或包装工具。**空工具策略（`tools: []`）下，该顶层 `run_code` 传输本身也被关闭**：子节点只能回文本，宿主会以「Tool is unavailable in this workflow activation」拒绝调用。省略 `tools` 时沿用父级工具集，行为与空数组不同。显式允许的强工具仍可自行产生副作用；插件不提供操作系统沙箱。
+- 新执行操作在激活提示、检查点和状态中携带稳定 `operationId`。失败且未声明可安全重试的节点，需要验证原子会话历史，否则进入待核查。同会话继续不保证外部副作用恰好发生一次；须核对实际状态和回执。模型返回的回执文本没有经过插件独立验证。
+- 全局分类使用独立系统指令、JSON 引用的用户文本及最小活动工作流信息；限时 10 秒，请求 256 个输出 token，接收上限为 8192 字符和 1024 个块。分类器不响应中止时也会回退；解析或上游失败提供可读诊断。无活动工作流时不修订，进度询问直接处理；相同人类消息 ID 在当前适配器中只判断一次。
+- 列表仅展示当前所有者最近 100 条未归档预览。归档需显式调用，会压缩插件快照并校验哈希和读取结果；单条解压内容最多 32 MiB，支持读取、重启后恢复。运行中、已中断、待核查记录和继续运行的祖先受保护。归档不删除宿主会话；压缩归档与会话历史仍可持续增长，没有全局磁盘配额或自动删除策略。继续前须先恢复归档。
+
+[可靠性示例](workflow.reliability.example.json) 包含显式输入、条件、超时、重试和并行收集。从包含 `dynamic-workflow` 目录的父工作目录运行；目录名不同则修改唯一的输入路径。示例角色不调用工具且声明无写入。真实模型若未精确返回 `yes`，分析阶段会按条件跳过。完整英文约定见 [README.en.md](README.en.md#local-052-reliability-contract)。
+
+
+### 归档发现与降级
+
+`/workflow archive-preview <runId>` 只读返回当前所有者与精确运行范围、状态、归档资格、保护原因和插件记录序列化后的 `storageBytes`；这不是宿主后端实际磁盘占用。使用 `/workflow {"action":"list","includeArchived":true,"offset":0}` 查看包含归档的记录，返回 `isArchived`、`archivedAt`、`total` 和 `nextOffset`，每页 100 条。使用返回的 `nextOffset` 查询后续页。`includeArchived` 必须为布尔值且仅适用于 list；`offset` 必须为仅用于 list 的非负整数。预览、读取与恢复须指定当前会话所有者的 runId。归档载荷数量和总存储仍无上限；分页不等于持久化保留策略。
+
+仅在节点指纹相同时保留 operationId，包括重试和继续；独立节点输入或定义变化时生成新 ID。清理不确定性会关闭工作流后续准入，阻塞未开始节点，等待已运行成员结束，并保留目标和胶囊锁。
+
+0.5.0 引入可选持久化字段 operationId、inputDigests、archivedAt、archivePayload、archiveHash，检查点也增加 operationId。旧 0.4.0 严格 schema 无法读取这些新记录。降级必须同时恢复匹配的安装前插件状态备份和旧插件；Ops 负责运行主机备份，并须保留用户会话。此处未验证真实运行环境的回滚。
+
+
+新 `run` 选择到同一所有者、同一规范文件路径的已归档历史记录时，也会拒绝准入。必须先执行 `/workflow restore <priorRunId>`，然后再运行文件。即使文件已改为新的工作流 ID，也须先恢复历史记录。此保守边界用于保留失败操作历史及已完成胶囊身份；归档不授权重新执行。

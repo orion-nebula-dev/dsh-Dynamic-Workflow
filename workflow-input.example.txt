@@ -1,0 +1,1 @@
+Example acceptance input: return a short factual plan and list two observable checks.

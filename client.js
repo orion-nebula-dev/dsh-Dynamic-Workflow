@@ -17,7 +17,7 @@ window.__ModuleLoader__.load({
         empty: '当前会话还没有工作流。输入工作流 JSON 文件路径，或让助手根据任务创建工作流。',
         path: '工作流文件路径', pathPlaceholder: '例如 workflow.json', start: '运行工作流',
         history: '运行记录', model: '子 Agent 模型', inherit: '沿用已有模型配置',
-        concurrency: '当前节点内 Agent 并发上限', parallelAgents: '个 Agent 在当前节点内同时运行', serialNodesNote: '顶层节点按顺序依次执行；并发上限仅作用于当前节点内的 Agent。', stop: '停止运行', resume: '继续工作流', switch: '切换模型并继续',
+        concurrency: '当前节点内 Agent 并发上限', parallelAgents: '个 Agent 在当前节点内同时运行', serialNodesNote: '顶层节点按顺序依次执行；并发上限仅作用于当前节点内的 Agent。', revise: '读取新定义并修订', stop: '停止运行', resume: '继续工作流', switch: '切换模型并继续',
         modelNote: '继续前先停止并清理当前执行。已完成结果保留，未完成节点恢复原 Agent 会话后使用所选模型。',
         agentSession: 'Agent 会话', contextResumed: '原会话续跑', contextMissing: '此记录缺少部分 Agent 会话，无法恢复对应节点的上下文。',
         reviewNote: '存在待核查节点。请让助手检查中断产生的影响，更新工作流后再运行。',
@@ -40,7 +40,7 @@ window.__ModuleLoader__.load({
         empty: 'No workflow in this session yet. Enter a workflow JSON path or ask the assistant to create one.',
         path: 'Workflow file path', pathPlaceholder: 'For example workflow.json', start: 'Run workflow',
         history: 'Run history', model: 'Subagent model', inherit: 'Keep existing model configuration',
-        concurrency: 'Agent concurrency limit within the current node', parallelAgents: 'Agents in parallel within the current node', serialNodesNote: 'Top-level nodes run sequentially; the concurrency limit applies only to Agents within the current node.', stop: 'Stop run', resume: 'Continue workflow', switch: 'Switch model and continue',
+        concurrency: 'Agent concurrency limit within the current node', parallelAgents: 'Agents in parallel within the current node', serialNodesNote: 'Top-level nodes run sequentially; the concurrency limit applies only to Agents within the current node.', revise: 'Revise from file', stop: 'Stop run', resume: 'Continue workflow', switch: 'Switch model and continue',
         modelNote: 'Stops and drains active work first. Completed results are kept; unfinished nodes restore their original Agent sessions with the selected model.',
         agentSession: 'Agent session', contextResumed: 'Session continued', contextMissing: 'Some historical Agent sessions are missing; their context cannot be restored.',
         reviewNote: 'Some nodes require review. Ask the assistant to check interrupted effects and update the workflow before running again.',
@@ -190,13 +190,13 @@ window.__ModuleLoader__.load({
       }, [active?.runId]);
       async function operate(action) {
         setError('');
-        if (action === 'run' && !path.trim()) { setError(t('required')); return; }
+        if (['run', 'revise'].includes(action) && !path.trim()) { setError(t('required')); return; }
         if (action !== 'stop' && (!Number.isInteger(Number(concurrency)) || Number(concurrency) < 1 || Number(concurrency) > 8)) { setError(t('invalidConcurrency')); return; }
         setBusy(true); epoch.current++;
         try {
           const args = { action };
-          if (action === 'run') args.workflowPath = path.trim();
-          else args.runId = active.runId;
+          if (['run', 'revise'].includes(action)) args.workflowPath = path.trim();
+          if (action !== 'run') args.runId = active.runId;
           if (action !== 'stop') {
             args.concurrency = Number(concurrency);
             if (selection) { const [provider, model] = JSON.parse(selection); if (provider) args.provider = provider; args.model = model; }
@@ -322,6 +322,7 @@ window.__ModuleLoader__.load({
         catalogError && h('p', { className: 'dwf-error', role: 'alert' }, `${t('modelError')}: ${catalogError}`),
         (catalog?.failures || []).map(failure => h('p', { key: failure.id, className: 'dwf-meta' }, `${t('modelError')} · ${failure.name}: ${failure.message}`)),
         active && completed < entries.length && h('div', { className: 'dwf-toolbar' }, button(busy ? t('busy') : t(active.status === 'running' ? 'switch' : 'resume'), () => operate('resume'), { className: 'dwf-primary', disabled: busy || active.resumeSupported === false || needsReview || (entries.length > 0 && completed === entries.length) })),
+        active && h('div', { className: 'dwf-controls' }, h('input', { type: 'text', value: path, 'aria-label': t('path'), placeholder: t('pathPlaceholder'), disabled: busy, onChange: event => setPath(event.target.value) }), button(t('revise'), () => operate('revise'), { disabled: busy || !path.trim() })),
         !fixedRunId && h('form', { className: 'dwf-controls', style: { marginTop: 18 }, onSubmit: event => { event.preventDefault(); operate('run'); } }, h('label', { className: 'dwf-field grow' }, h('span', null, t('path')), h('input', { type: 'text', value: path, placeholder: t('pathPlaceholder'), disabled: busy, onChange: event => setPath(event.target.value) })), h('button', { type: 'submit', className: 'dwf-primary', disabled: busy || !path.trim() }, busy ? t('busy') : t('start'))));
       const timeline = h('ol', { className: 'dwf-timeline' }, entries.map(([id, node]) => {
         const outputNode = nodeOutput?.runId === active.runId && (nodeOutput.id === id || node.stageMembers?.some(([memberId]) => nodeOutput.id === memberId)) ? nodeOutput : undefined;
@@ -420,7 +421,7 @@ window.__ModuleLoader__.load({
           if (event.data.name !== 'dynamic_workflow') return null;
           try {
             const args = JSON.parse(event.data.arguments);
-            return ['run', 'resume'].includes(args.action) ? { id: String(event.data.callId), role: 'start' } : null;
+            return ['run', 'resume', 'revise'].includes(args.action) ? { id: String(event.data.callId), role: 'start' } : null;
           } catch { return null; }
         },
         'tool/result': event => workflowResult(event) ? { id: String(event.data.message.source.callId), role: 'update' } : null,

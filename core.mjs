@@ -62,6 +62,8 @@ export function validateWorkflow(definition) {
       }
     }
   }
+  if (Object.hasOwn(workflow, 'approval') || Object.hasOwn(workflow, 'humanApproval')) throw new TypeError('Human approval is unsupported: no verified human-source authority');
+  if (workflow.inputFiles !== undefined && (!Array.isArray(workflow.inputFiles) || workflow.inputFiles.length > 16 || workflow.inputFiles.some(path => !nonempty(path) || /^[a-z][a-z0-9+.-]*:/i.test(path)) || new Set(workflow.inputFiles).size !== workflow.inputFiles.length)) throw new TypeError('inputFiles requires at most 16 unique local file paths; URLs are unsupported');
   const nodes = new Map();
   const sourceNodes = workflow.nodes;
   for (const node of sourceNodes) {
@@ -143,6 +145,7 @@ export function validateWorkflow(definition) {
     const gate = { ...source, id: source.id, deps: memberNodes.map(node => node.id), agentStep: { groupId: source.id, kind: 'collect', members: [...memberIds] }, retrySafe: true };
     delete gate.agents;
     gate.agentConcurrency = limit;
+    delete gate.condition; // Conditions apply to members; collection remains a pure gate.
     delete gate.agentId;
     delete gate.agentTitle;
     delete gate.role;
@@ -157,6 +160,12 @@ export function validateWorkflow(definition) {
     if (!node || typeof node.id !== 'string' || !node.id.trim() || nodes.has(node.id)) {
       throw new TypeError('Node IDs must be nonempty and unique');
     }
+    if (Object.hasOwn(node, 'approval') || Object.hasOwn(node, 'humanApproval')) throw new TypeError(`Human approval is unsupported for ${node.id}: no verified human-source authority`);
+    if (node.retrySafe !== undefined && typeof node.retrySafe !== 'boolean') throw new TypeError(`retrySafe must be boolean for ${node.id}`);
+    if (node.timeoutMs !== undefined && (!Number.isSafeInteger(node.timeoutMs) || node.timeoutMs < 1 || node.timeoutMs > 3600000)) throw new TypeError(`timeoutMs must be 1–3600000 for ${node.id}`);
+    if (node.maxRetries !== undefined && (!Number.isSafeInteger(node.maxRetries) || node.maxRetries < 0 || node.maxRetries > 3 || (node.maxRetries > 0 && node.retrySafe !== true))) throw new TypeError(`maxRetries must be 0–3 and requires retrySafe:true for ${node.id}`);
+    if (node.writeResources !== undefined && (!Array.isArray(node.writeResources) || node.writeResources.some(resource => !nonempty(resource) || !/^(\*|[a-zA-Z0-9_.:/-]+)$/.test(resource)) || new Set(node.writeResources).size !== node.writeResources.length)) throw new TypeError(`writeResources must be unique resource names (or *) for ${node.id}`);
+    if (node.condition !== undefined && (!object(node.condition) || Object.keys(node.condition).some(key => !['dependency', 'equals'].includes(key)) || !(node.deps ?? []).includes(node.condition.dependency) || !Object.hasOwn(node.condition, 'equals'))) throw new TypeError(`condition for ${node.id} requires a declared dependency and equals JSON value; expressions are unsupported`);
     if (Object.hasOwn(node, 'tools')) validateTools(node.tools, node.id);
     if (Object.hasOwn(node, 'agentStep')) {
       const step = node.agentStep;
@@ -273,7 +282,7 @@ export async function loadWorkflow(path) {
  * with a fresh Agent. Their descendants are blocked otherwise. First runs
  * and previously pending nodes do not require this opt-in.
  */
-export async function runWorkflow({ workflow: definition, workflowPath, statePath, storage, executor, executorVersion = '1', concurrency = 1, resumeNodeIds = [], signal = new AbortController().signal }) {
+export async function runWorkflow({ workflow: definition, workflowPath, statePath, storage, inputDigests = [], executor, executorVersion = '1', concurrency = 1, resumeNodeIds = [], signal = new AbortController().signal }) {
   const workflow = definition ? validateWorkflow(definition) : await loadWorkflow(workflowPath);
   if (typeof executor !== 'function') throw new TypeError('executor must be a function');
   if (!Array.isArray(resumeNodeIds) || resumeNodeIds.some(id => typeof id !== 'string' || !workflow.nodes.some(node => node.id === id))) throw new TypeError('resumeNodeIds must name existing nodes');
@@ -315,10 +324,11 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
     }
     if (previous?.version !== 1 || previous.workflowId !== workflow.id) previous = undefined;
     const state = { version: 1, workflowId: workflow.id, runId: randomUUID(), status: 'running', nodes: Object.fromEntries(workflow.nodes.map(node => [node.id,
-      node.retrySafe !== true && !resumable.has(node.id) && ['running', 'interrupted', 'needs_review'].includes(previous?.nodes?.[node.id]?.status)
-        ? { status: 'needs_review', error: 'Manual review required: previous execution may have produced side effects; declare retrySafe: true only after verifying retry safety.' }
+      node.retrySafe !== true && !resumable.has(node.id) && ['running', 'interrupted', 'needs_review', 'failed'].includes(previous?.nodes?.[node.id]?.status)
+        ? { ...copy(previous.nodes[node.id]), status: 'needs_review', error: 'Manual review required: previous execution may have produced side effects; declare retrySafe: true only after verifying retry safety.' }
         : { status: 'pending' },
     ])) };
+    for (const node of Object.values(state.nodes)) if (node.status === 'needs_review') { delete node.output; delete node.outputHash; node.operationId ??= randomUUID(); }
     let writes = Promise.resolve();
     const save = () => {
       const snapshot = copy(state);
@@ -328,41 +338,61 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
     await save();
     const pending = new Map(workflow.nodes.filter(node => state.nodes[node.id].status === 'pending').map(node => [node.id, node]));
     const running = new Map();
+    let admissionClosed = false;
     async function runNode(node) {
       const id = node.id;
       const dependencies = Object.fromEntries(node.deps.map(dep => [dep, copy(state.nodes[dep].output)]));
-      const fingerprint = hash({ workflowId: workflow.id, executorVersion, node: { ...node, deps: [...node.deps].sort() }, dependencies: Object.fromEntries(node.deps.map(dep => [dep, { fingerprint: state.nodes[dep].fingerprint, outputHash: state.nodes[dep].outputHash }])) });
+      const fingerprint = hash({ workflowId: workflow.id, executorVersion, ...(inputDigests.length ? { inputDigests } : {}), node: { ...node, deps: [...node.deps].sort() }, dependencies: Object.fromEntries(node.deps.map(dep => [dep, { fingerprint: state.nodes[dep].fingerprint, outputHash: state.nodes[dep].outputHash }])) });
       const old = previous?.nodes?.[id];
       if (old?.status === 'completed' && old.fingerprint === fingerprint && Object.hasOwn(old, 'output') && old.outputHash === hash(old.output)) {
         state.nodes[id] = { ...copy(old), reused: true };
         await save();
         return;
       }
-      state.nodes[id] = { status: 'running', fingerprint, reused: false };
+      const operationId = (old?.fingerprint === fingerprint ? old.operationId : undefined) ?? randomUUID();
+      state.nodes[id] = { status: 'running', fingerprint, operationId, reused: false };
       await save();
       try {
         const step = node.reviewStep;
-        if (node.agentStep?.kind === 'collect') {
+        if (node.condition && canonical(dependencies[node.condition.dependency]) !== canonical(node.condition.equals)) {
+          state.nodes[id] = { status: 'completed', fingerprint, operationId, reused: false, skipped: true, output: null, outputHash: hash(null) };
+        } else if (node.agentStep?.kind === 'collect') {
           const output = Object.fromEntries(node.agentStep.members.map(memberId => [memberId, copy(dependencies[`${id}/agent/${memberId}`])]));
-          state.nodes[id] = { status: 'completed', fingerprint, reused: false, output, outputHash: hash(output) };
+          state.nodes[id] = { status: 'completed', fingerprint, operationId, reused: false, output, outputHash: hash(output) };
         } else if (step?.kind === 'gate') {
           const report = copy(dependencies[step.reviewNodeId]);
           const failed = report?.verdict !== 'approved';
-          state.nodes[id] = { status: failed ? 'failed' : 'completed', fingerprint, reused: false, output: report, outputHash: hash(report), ...(failed ? { error: `Review limit ${step.maxRounds} reached: changes-required` } : {}) };
+          state.nodes[id] = { status: failed ? 'failed' : 'completed', fingerprint, operationId, reused: false, output: report, outputHash: hash(report), ...(failed ? { error: `Review limit ${step.maxRounds} reached: changes-required` } : {}) };
         } else {
           const previousReport = step && step.kind === 'review' ? dependencies[step.previousReview] : step?.kind === 'fix' ? dependencies[step.previousReview] : undefined;
           if (previousReport?.verdict === 'approved') {
             const output = copy(previousReport);
-            state.nodes[id] = { status: 'completed', fingerprint, reused: false, skipped: true, output, outputHash: hash(output) };
+            state.nodes[id] = { status: 'completed', fingerprint, operationId, reused: false, skipped: true, output, outputHash: hash(output) };
           } else {
-            let output = copy(await abortable(() => executor(copy(node), { dependencies, fingerprint, runId: state.runId, signal }), signal));
+            let output;
+            for (let attempt = 0; ; attempt++) {
+              const timeout = new AbortController();
+              const attemptSignal = AbortSignal.any([signal, timeout.signal]);
+              const timer = setTimeout(() => timeout.abort(new Error(`Node ${id} timeout after ${node.timeoutMs ?? 600000} ms; reconcile operation ${operationId}`)), node.timeoutMs ?? 600000);
+              try {
+                output = copy(await abortable(() => executor(copy(node), { dependencies, fingerprint, operationId, attempt, runId: state.runId, signal: attemptSignal }), attemptSignal));
+                break;
+              } catch (error) {
+                if (signal.aborted || node.retrySafe !== true || attempt >= (node.maxRetries ?? 0) || error?.needsReview) throw error;
+              } finally { clearTimeout(timer); }
+            }
             if (signal.aborted) throw new Error('Interrupted');
             if (step?.kind === 'review') output = reviewReport(output);
-            state.nodes[id] = { status: 'completed', fingerprint, reused: false, output, outputHash: hash(output) };
+            state.nodes[id] = { status: 'completed', fingerprint, operationId, reused: false, output, outputHash: hash(output) };
           }
         }
       } catch (error) {
-        state.nodes[id] = { status: signal.aborted ? 'interrupted' : 'failed', fingerprint, reused: false, error: String(error?.message ?? error) };
+        if (error?.needsReview) {
+          admissionClosed = true;
+          for (const pendingId of pending.keys()) state.nodes[pendingId] = { status: 'blocked', error: 'Admission closed: executor cleanup or history requires review' };
+          pending.clear();
+        }
+        state.nodes[id] = { status: error?.needsReview ? 'needs_review' : signal.aborted ? 'interrupted' : 'failed', fingerprint, operationId, reused: false, error: String(error?.message ?? error) };
       }
       await save();
     }
@@ -371,7 +401,7 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
         const gate = group.nodes.find(node => node.agentStep?.kind === 'collect');
         const limit = gate ? Math.min(concurrency, gate.agentConcurrency) : 1;
         while (group.nodes.some(node => pending.has(node.id)) || running.size) {
-          if (!signal.aborted) {
+          if (!signal.aborted && !admissionClosed) {
             for (const node of group.nodes) {
               const id = node.id;
               if (!pending.has(id)) continue;
@@ -381,6 +411,11 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
                 continue;
               }
               if (running.size >= limit) continue;
+              const resources = node.writeResources ?? ['*'];
+              if ([...running.keys()].some(runningId => {
+                const other = workflow.nodes.find(item => item.id === runningId)?.writeResources ?? ['*'];
+                return resources.length && other.length && (resources.includes('*') || other.includes('*') || resources.some(item => other.includes(item)));
+              })) continue;
               if (!node.deps.every(dep => state.nodes[dep].status === 'completed')) continue;
               pending.delete(id);
               const task = runNode(node).finally(() => running.delete(id));
@@ -397,7 +432,7 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
       await writes.catch(() => {});
       throw error;
     }
-    state.status = signal.aborted ? 'interrupted'
+    state.status = admissionClosed ? 'needs_review' : signal.aborted ? 'interrupted'
       : Object.values(state.nodes).some(node => node.status === 'needs_review') ? 'needs_review'
       : Object.values(state.nodes).some(node => node.status === 'failed') ? 'failed' : 'completed';
     await save();
@@ -405,14 +440,17 @@ export async function runWorkflow({ workflow: definition, workflowPath, statePat
   }
 }
 
-function abortable(invoke, signal) {
-  return new Promise((resolve, reject) => {
-    const abort = () => reject(signal.reason ?? new Error('Interrupted'));
-    if (signal.aborted) { abort(); return; }
-    signal.addEventListener('abort', abort, { once: true });
-    Promise.resolve().then(() => {
-      if (signal.aborted) throw signal.reason ?? new Error('Interrupted');
-      return invoke();
-    }).then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
-  });
+async function abortable(invoke, signal) {
+  signal.throwIfAborted();
+  // Await actual executor settlement even after abort. No successor writer or retry
+  // may be admitted while the previous executor still owns external effects.
+  try {
+    const value = await invoke();
+    signal.throwIfAborted();
+    return value;
+  } catch (error) {
+    if (error?.needsReview) throw error;
+    if (signal.aborted) throw signal.reason ?? new Error('Interrupted');
+    throw error;
+  }
 }
