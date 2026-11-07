@@ -5,7 +5,7 @@ import { classifyMessage, routerInstruction, isRootAgent } from './global.mjs';
 test('classifies a parent message with the current session model and parses JSON', async () => {
   const calls = [];
   const llm = { async *stream(options) { calls.push(options); yield { type: 'text-delta', text: '{"action":"revise","reason":"new acceptance criteria"}' }; yield { type: 'finish', reason: { kind: 'stop' } }; } };
-  const result = await classifyMessage({ llm, config: { provider: 'p', model: 'm' }, message: 'Add an English deliverable', signal: new AbortController().signal });
+  const result = await classifyMessage({ llm, config: { provider: 'p', model: 'm' }, message: 'Add an English deliverable', active: { runId: 'r1' }, signal: new AbortController().signal });
   assert.deepEqual(result, { action: 'revise', reason: 'new acceptance criteria' });
   assert.equal(calls[0].provider, 'p');
   assert.equal(calls[0].model, 'm');
@@ -24,7 +24,8 @@ test('does not duplicate final text blocks after streamed deltas', async () => {
 
 test('falls back to direct handling when classifier output is invalid', async () => {
   const llm = { async *stream() { yield { type: 'text-delta', text: 'not json' }; } };
-  assert.deepEqual(await classifyMessage({ llm, config: { provider: 'p', model: 'm' }, message: 'hello' }), { action: 'direct' });
+  const result = await classifyMessage({ llm, config: { provider: 'p', model: 'm' }, message: 'hello' });
+  assert.equal(result.action, 'direct'); assert.match(result.diagnostic, /routing failed/);
 });
 
 test('builds a bounded instruction for creating or revising a workflow', () => {

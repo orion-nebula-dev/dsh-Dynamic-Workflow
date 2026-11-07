@@ -2,12 +2,24 @@
   "id": "serial-multi-agent-example",
   "title": "并行分析与串行交付",
   "agents": {
-    "planner": { "title": "方案代理" },
-    "reviewer": { "title": "风险代理" }
+    "planner": {
+      "title": "方案代理"
+    },
+    "reviewer": {
+      "title": "风险代理"
+    }
   },
   "roles": {
-    "analyze": { "title": "分析", "prompt": "只根据任务返回简短分析，不调用工具。", "tools": [] },
-    "deliver": { "title": "交付", "prompt": "结合 Dependencies 中按成员 id 收集的结果，编写最终方案。", "tools": [] }
+    "analyze": {
+      "title": "分析",
+      "prompt": "只根据任务返回简短分析，不调用工具。",
+      "tools": []
+    },
+    "deliver": {
+      "title": "交付",
+      "prompt": "结合 Dependencies 中按成员 id 收集的结果，编写最终方案。",
+      "tools": []
+    }
   },
   "nodes": [
     {
@@ -21,7 +33,8 @@
           "role": "analyze",
           "prompt": "为小型读书会制定三步活动方案。只输出文本。",
           "tools": [],
-          "retrySafe": true
+          "retrySafe": true,
+          "writeResources": []
         },
         {
           "id": "risk",
@@ -29,14 +42,17 @@
           "role": "analyze",
           "prompt": "列出小型读书会的两项组织风险及对应措施。只输出文本。",
           "tools": [],
-          "retrySafe": true
+          "retrySafe": true,
+          "writeResources": []
         }
       ]
     },
     {
       "id": "deliver",
       "title": "汇总交付",
-      "deps": ["analyze"],
+      "deps": [
+        "analyze"
+      ],
       "agentId": "planner",
       "role": "deliver",
       "prompt": "读取 analyze 的 plan 和 risk 结果，输出含风险措施的最终活动方案。",

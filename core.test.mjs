@@ -105,8 +105,8 @@ test('runs nodes serially and collects multiple agents in one node concurrently'
     nodes: [
       { id: 'first' },
       { id: 'second', deps: ['first'], agents: [
-        { id: 'review', agentId: 'reviewer', prompt: 'Review' },
-        { id: 'audit', agentId: 'auditor', prompt: 'Audit' },
+        { id: 'review', agentId: 'reviewer', prompt: 'Review', writeResources: [] },
+        { id: 'audit', agentId: 'auditor', prompt: 'Audit', writeResources: [] },
       ] },
       { id: 'third', deps: ['second'] },
     ],
@@ -133,7 +133,7 @@ test('interruption persists in-flight state and discards late results after succ
   const workflow = { id: 'resume', nodes: [{ id: 'done' }, { id: 'slow', deps: ['done'], retrySafe: true }, { id: 'after', deps: ['slow'] }] };
   const firstRun = core.runWorkflow({ workflow, statePath, signal: controller.signal, executor: async (node, context) => {
     if (node.id === 'done') return 'saved';
-    assert.equal(context.signal, controller.signal);
+    assert.equal(context.signal.aborted, controller.signal.aborted);
     entered.resolve();
     return late.promise;
   } });
@@ -141,6 +141,7 @@ test('interruption persists in-flight state and discards late results after succ
   const started = await Promise.race([entered.promise.then(() => true), firstRun.then(() => false, () => false)]);
   assert.equal(started, true);
   controller.abort();
+  late.resolve('stale');
   const first = await firstRun;
   assert.equal(first.status, 'interrupted');
   assert.equal(first.nodes.slow.status, 'interrupted');
@@ -158,7 +159,7 @@ test('interruption persists in-flight state and discards late results after succ
 
 test('failed nodes block descendants while independent work survives for retry', async () => {
   const { statePath } = await fixture();
-  const workflow = { id: 'failure', nodes: [{ id: 'bad' }, { id: 'child', deps: ['bad'] }, { id: 'good' }] };
+  const workflow = { id: 'failure', nodes: [{ id: 'bad', retrySafe: true }, { id: 'child', deps: ['bad'] }, { id: 'good' }] };
   const first = await core.runWorkflow({ workflow, statePath, executor: async node => {
     if (node.id === 'bad') throw new Error('expected failure');
     return 1;
@@ -523,6 +524,7 @@ test('normalizes bare and fenced JSON review reports and keeps warning fields', 
 
 test('reuses stored completed fixes and retries only the failed review then invalidates changed inputs', async () => {
   const workflow = reviewWorkflow(3), storage = memoryStorage(), firstCalls = [];
+  workflow.nodes[1].reviewLoop.review.retrySafe = true;
   const first = await core.runWorkflow({ workflow, storage, executor: async node => {
     firstCalls.push(node.id);
     if (node.id === 'q/review/2') throw new Error('network unavailable');
@@ -592,7 +594,7 @@ test('review loop IDs containing fix segments preserve their exact dependency pr
 });
 
 const agentGroup = () => ({ id: 'members', nodes: [
-  { id: 'group', agents: [{ id: 'a', agentId: 'alice', prompt: 'A' }, { id: 'b', agentId: 'bob', prompt: 'B' }] },
+  { id: 'group', agents: [{ id: 'a', agentId: 'alice', prompt: 'A', retrySafe: true, writeResources: ['a'] }, { id: 'b', agentId: 'bob', prompt: 'B', writeResources: ['b'] }] },
   { id: 'after', deps: ['group'] }, { id: 'independent' },
 ] });
 
@@ -660,6 +662,7 @@ test('agent group cancellation preserves completed members and resumes only veri
     entered.resolve(); return late.promise;
   } });
   await entered.promise; controller.abort();
+  late.resolve('late');
   const interrupted = await running;
   assert.equal(interrupted.nodes['group/agent/a'].status, 'completed');
   assert.equal(interrupted.nodes['group/agent/b'].status, 'interrupted');

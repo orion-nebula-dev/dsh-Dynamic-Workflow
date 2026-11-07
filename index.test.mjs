@@ -95,6 +95,7 @@ async function fixture(t, execute = async prompt => ({ prompt }), onDispose = as
     contains(a, b) { const rel = relative(a.targetKey, b.targetKey); return !rel.startsWith('..') && !isAbsolute(rel); },
     readText(target) { return readFile(target.targetKey, 'utf8'); },
   };
+  fs.readBytes = async (target, signal, maxBytes) => { signal?.throwIfAborted(); const bytes = new TextEncoder().encode(await fs.readText(target)); if (bytes.byteLength > maxBytes) throw Error('FS_TOO_LARGE: file too large (1 MiB input limit)'); return bytes; };
   const engine = { start(request) {
     requests.push(request);
     if (options.native) {
@@ -222,8 +223,8 @@ test('global router judges queued human prompts separately', async t => {
   const hook = [...f.listeners.get('agent/pre-step')][0];
   await hook({ agent: f.owner, messages, signal: new AbortController().signal }, async () => ({ kind: 'enter', messages }));
   assert.equal(calls.length, 2);
-  assert.ok(calls[0].endsWith('first prompt'));
-  assert.ok(calls[1].endsWith('second prompt'));
+  assert.equal(JSON.parse(calls[0]).message, 'first prompt');
+  assert.equal(JSON.parse(calls[1]).message, 'second prompt');
 });
 
 test('global router uses the selected model before the first request and after a switch', async t => {
@@ -533,7 +534,7 @@ test('revise stops the source run, reads the new definition, and records the tri
   assert.equal(result.status, 'completed');
   assert.equal(result.revisionReason, 'user changed acceptance criteria');
   assert.equal(result.resumedFrom, first.runId);
-  assert.equal(f.requests.at(-1).args.prompt, 'new');
+  assert.match(f.requests.at(-1).args.prompt, /^new\n/);
 });
 
 test('changed executed capsule history requires a fresh workflow identity', async t => {
@@ -545,9 +546,9 @@ test('changed executed capsule history requires a fresh workflow identity', asyn
   const changed = { ...original, nodes: [{ id: 'a', agentId: 'worker', prompt: 'Changed task' }] };
   await f.write(changed);
   const second = await f.call({ action: 'run', workflowPath: 'flow.json' });
-  assert.equal((await finished(f, second.runId)).status, 'failed');
+  assert.equal((await finished(f, second.runId)).status, 'needs_review');
   const detail = await f.call({ action: 'status', runId: second.runId, nodeId: 'a' });
-  assert.match(detail.node.error, /history differs/i);
+  assert.match(detail.node.error, /definition|fingerprint|history/i);
   assert.equal(f.requests.length, 1);
   await f.write({ ...changed, id: 'capsule-version-2' });
   const fresh = await f.call({ action: 'run', workflowPath: 'flow.json' });
@@ -589,7 +590,7 @@ test('persists history across plugin restarts and scopes access to stable sessio
   await f.unload();
   await f.restart();
   const resumedOwner = { ...f.owner };
-  assert.equal((await f.call({ action: 'status', runId: first.runId, nodeId: 'a' }, resumedOwner)).node.output.prompt, 'hello');
+  assert.match((await f.call({ action: 'status', runId: first.runId, nodeId: 'a' }, resumedOwner)).node.output.prompt, /^hello\n/);
   const next = await f.call({ action: 'run', workflowPath: 'flow.json' }, resumedOwner);
   assert.equal((await finished(f, next.runId)).status, 'completed');
   assert.equal(f.requests.length, 1);
@@ -683,7 +684,7 @@ test('rejects cross-session access, denied fs reads, arbitrary state paths and m
   const other = { ...f.owner, id: 'other-session' };
   await assert.rejects(f.call({ action: 'status', runId: run.runId }, other), /not found|owner/i);
   assert.deepEqual((await f.call({ action: 'list' }, other)).runs, []);
-  const denied = { id: 'denied', ctx: { get: key => key === 'fs' ? { ...f.owner.ctx.get(key), readText: async () => { throw new Error('FS policy denied'); } } : f.owner.ctx.get(key) } };
+  const denied = { id: 'denied', ctx: { get: key => key === 'fs' ? { ...f.owner.ctx.get(key), readBytes: async () => { throw new Error('FS policy denied'); }, readText: async () => { throw new Error('FS policy denied'); } } : f.owner.ctx.get(key) } };
   await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }, denied), /FS policy denied/);
   await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json', statePath: '/tmp/owned' }), /statePath|unknown/i);
   await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }, { id: 'no-engine', ctx: { get: key => key === 'workflowEngine' ? undefined : f.owner.ctx.get(key) } }), /workflowEngine/i);
@@ -724,7 +725,7 @@ test('resume keeps saved definition and completed fingerprints while applying ex
     if (prompt.startsWith('second') && options.model !== 'new-model') throw new Error('switch model');
     return { prompt };
   });
-  const definition = { id: 'flow', title: 'Saved title', nodes: [{ id: 'a', prompt: 'first', model: 'node-model' }, { id: 'b', prompt: 'second', deps: ['a'] }] };
+  const definition = { id: 'flow', title: 'Saved title', nodes: [{ id: 'a', prompt: 'first', model: 'node-model' }, { id: 'b', prompt: 'second', deps: ['a'], retrySafe: true }] };
   await f.write(definition);
   const first = await f.call({ action: 'run', workflowPath: 'flow.json', provider: 'old-provider', model: 'old-model' });
   assert.equal((await finished(f, first.runId)).status, 'failed');
@@ -975,8 +976,8 @@ test('messages reach the selected running member of a multi-Agent node', async t
   const f = await fixture(t, async () => { await held; return 'done'; }, undefined, { native: true,
     onMessage: request => { messages.push(request); return 'member-message'; } });
   await f.write({ id: 'member-messages', nodes: [{ id: 'check', agents: [
-    { id: 'read', agentId: 'reader', prompt: 'Read' },
-    { id: 'audit', agentId: 'auditor', prompt: 'Audit' },
+    { id: 'read', agentId: 'reader', prompt: 'Read', writeResources: [] },
+    { id: 'audit', agentId: 'auditor', prompt: 'Audit', writeResources: [] },
   ] }] });
   const run = await f.call({ action: 'run', workflowPath: 'flow.json', concurrency: 2 });
   try {
@@ -995,4 +996,217 @@ test('treats null agent results as failures and never executes input as JavaScri
   await f.write({ id: 'flow', nodes: [{ id: 'a', input: 'globalThis.compromised = true; ${evil}' }] });
   const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
   assert.equal((await finished(f, run.runId)).status, 'failed');
+});
+
+// Host adapter tests below use unit doubles, not live DSH/model acceptance.
+test('external inputs are re-read through parent policy and invalidate cache on resume', async t => {
+  const f = await fixture(t); let reads = 0;
+  const read = f.services.fs.readText; f.services.fs.readText = target => { if (target.targetKey.endsWith('input.txt')) reads++; return read(target); };
+  await writeFile(join(f.root, 'input.txt'), 'first');
+  await f.write({ id: 'external', inputFiles: ['input.txt'], nodes: [{ id: 'a', prompt: 'read input' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); await finished(f, run.runId);
+  await writeFile(join(f.root, 'input.txt'), 'changed');
+  const resumed = await f.call({ action: 'resume', runId: run.runId }); await finished(f, resumed.runId);
+  assert.equal(reads, 2); assert.equal(f.requests.length, 2);
+  f.services.fs.readText = () => { throw Error('policy denied'); };
+  await assert.rejects(f.call({ action: 'resume', runId: resumed.runId }), /policy denied/);
+});
+
+test('capsule input mismatch preserves saved child and requires review without activation', async t => {
+  const f = await fixture(t, undefined, undefined, { native: true });
+  await writeFile(join(f.root, 'input.txt'), 'first');
+  await f.write({ id: 'capsule-input', inputFiles: ['input.txt'], nodes: [{ id: 'a', agentId: 'writer', prompt: 'write' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const first = await finished(f, run.runId);
+  await writeFile(join(f.root, 'input.txt'), 'changed');
+  const resumed = await f.call({ action: 'resume', runId: run.runId }); const last = await finished(f, resumed.runId);
+  assert.equal(last.status, 'needs_review'); assert.equal(f.requests.length, 1);
+  assert.equal(last.nodes.a.agentSessionId, first.nodes.a.agentSessionId);
+});
+
+test('archive is explicit reversible owner-scoped and protects resume ancestry', async t => {
+  const f = await fixture(t); await f.write({ id: 'archive', nodes: [{ id: 'a', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); await finished(f, run.runId);
+  await f.call({ action: 'archive', runId: run.runId });
+  assert.deepEqual((await f.call({ action: 'list' })).runs, []);
+  assert.equal((await f.call({ action: 'archive-read', runId: run.runId })).runId, run.runId);
+  await assert.rejects(f.call({ action: 'restore', runId: run.runId }, { ...f.owner, id: 'stranger' }), /owner/);
+  await f.call({ action: 'restore', runId: run.runId }); assert.equal((await f.call({ action: 'list' })).runs.length, 1);
+  const resumed = await f.call({ action: 'resume', runId: run.runId }); await finished(f, resumed.runId);
+  await assert.rejects(f.call({ action: 'archive', runId: run.runId }), /ancestry/);
+});
+
+test('executed capsule agentId revision never silently swaps saved identity', async t => {
+  const f = await fixture(t, undefined, undefined, { native: true });
+  await f.write({ id: 'identity', nodes: [{ id: 'a', agentId: 'writer', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const first = await finished(f, run.runId);
+  await f.write({ id: 'identity', nodes: [{ id: 'a', agentId: 'replacement', prompt: 'a' }] });
+  const revised = await f.call({ action: 'revise', runId: run.runId, workflowPath: 'flow.json' }); const last = await finished(f, revised.runId);
+  assert.equal(last.status, 'needs_review'); assert.equal(f.requests.length, 1);
+  assert.equal(last.nodes.a.agentSessionId, first.nodes.a.agentSessionId);
+});
+
+
+test('bounded input files reject missing, oversized, total overflow and unsupported policy reads', async t => {
+  const f = await fixture(t);
+  for (const inputFiles of [Array.from({ length: 17 }, (_, i) => `${i}.txt`), ['https://example.invalid/file']]) {
+    await f.write({ id: 'limits', inputFiles, nodes: [] });
+    await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /inputFiles/);
+  }
+  await f.write({ id: 'limits', inputFiles: ['missing.txt'], nodes: [] });
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /inputFiles/);
+  for (let i = 0; i < 5; i++) await writeFile(join(f.root, `${i}.txt`), 'a'.repeat(1024 * 1024));
+  await f.write({ id: 'limits', inputFiles: ['0.txt', '1.txt', '2.txt', '3.txt', '4.txt'], nodes: [] });
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /4 MiB/);
+  await writeFile(join(f.root, '0.txt'), 'a'.repeat(1024 * 1024 + 1));
+  await f.write({ id: 'limits', inputFiles: ['0.txt'], nodes: [] });
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /1 MiB|large/i);
+  delete f.services.fs.readBytes;
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /bounded.*readBytes/i);
+});
+
+test('archive read and restore survive actual adapter unload and reopen', async t => {
+  const f = await fixture(t);
+  await f.write({ id: 'archive-durable', nodes: [{ id: 'a', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); await finished(f, run.runId);
+  const before = await f.call({ action: 'status', runId: run.runId, nodeId: 'a' });
+  await f.call({ action: 'archive', runId: run.runId }); await f.unload(); await f.restart();
+  assert.equal((await f.call({ action: 'list' })).runs.length, 0);
+  const archived = await f.call({ action: 'archive-read', runId: run.runId, nodeId: 'a' });
+  assert.deepEqual(archived.node, before.node);
+  await f.call({ action: 'restore', runId: run.runId });
+  assert.equal((await f.call({ action: 'list' })).runs[0].runId, run.runId);
+});
+
+test('child disposal failure requires review and prevents automatic retry', async t => {
+  const f = await fixture(t, async () => 'done', async () => { throw Error('child still owns writer'); });
+  await f.write({ id: 'cleanup', nodes: [{ id: 'a', prompt: 'write', retrySafe: true, maxRetries: 1 }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  const last = await finished(f, run.runId);
+  assert.equal(last.status, 'needs_review'); assert.equal(f.requests.length, 1);
+});
+
+test('explicit archive compresses plugin snapshots and verifies readback before restore', async t => {
+  const f = await fixture(t, async () => 'repetitive output '.repeat(4000));
+  await f.write({ id: 'compact', nodes: [{ id: 'a', prompt: 'text' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); await finished(f, run.runId);
+  const table = f.storageDomain.tables.get('runs'), before = JSON.stringify(table.get(run.runId)).length;
+  await f.call({ action: 'archive', runId: run.runId });
+  const saved = table.get(run.runId);
+  assert.equal(saved.snapshot, undefined); assert.equal(saved.workflow, undefined);
+  assert.ok(saved.archivePayload); assert.ok(JSON.stringify(saved).length < before / 2);
+  await f.unload(); await f.restart();
+  await f.call({ action: 'restore', runId: run.runId });
+  assert.equal(table.get(run.runId).snapshot.nodes.a.output.length, 72000);
+});
+
+test('external input mismatch protects native role child even without agentId', async t => {
+  const f = await fixture(t, undefined, undefined, { native: true });
+  await writeFile(join(f.root, 'input.txt'), 'one');
+  await f.write({ id: 'implicit-capsule', inputFiles: ['input.txt'], nodes: [{ id: 'a', prompt: 'a', tools: [], retrySafe: true }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const first = await finished(f, run.runId);
+  await writeFile(join(f.root, 'input.txt'), 'two');
+  const resumed = await f.call({ action: 'resume', runId: run.runId }); const last = await finished(f, resumed.runId);
+  assert.equal(last.status, 'needs_review'); assert.equal(f.requests.length, 1);
+  assert.equal(last.nodes.a.agentSessionId, first.nodes.a.agentSessionId);
+});
+
+for (const timed of [false, true]) test(`rework disposal uncertainty stops independent successors and quarantines target timed=${timed}`, async t => {
+  const f = await fixture(t, async () => { if (timed) await new Promise(r => setTimeout(r, 12)); return 'done'; }, async () => { throw Error('uncertain child drain'); });
+  await f.write({ id: `cleanup-rework-${timed}`, nodes: [{ id: 'a', prompt: 'a', retrySafe: true, maxRetries: 1, timeoutMs: timed ? 2 : 1000 }, { id: 'b', prompt: 'b' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const last = await finished(f, run.runId);
+  assert.equal(last.status, 'needs_review'); assert.equal(f.requests.length, 1); assert.equal(last.nodes.b.status, 'blocked');
+  await assert.rejects(f.call({ action: 'run', workflowPath: './flow.json' }), /locked|quarantin/i);
+});
+
+test('rework archive preview is exact read-only owner scoped and archived records are discoverable', async t => {
+  const f = await fixture(t); await f.write({ id: 'preview-rework', nodes: [{ id: 'a', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); await finished(f, run.runId);
+  const before = JSON.stringify([...f.storageDomain.tables.get('runs')]);
+  const preview = await f.call({ action: 'archive-preview', runId: run.runId });
+  assert.equal(preview.ownerId, 'owner'); assert.equal(preview.runId, run.runId); assert.equal(preview.status, 'completed'); assert.equal(preview.eligible, true);
+  assert.equal(preview.storageBytes, Buffer.byteLength(JSON.stringify(f.storageDomain.tables.get('runs').get(run.runId))));
+  assert.equal(JSON.stringify([...f.storageDomain.tables.get('runs')]), before);
+  await assert.rejects(f.call({ action: 'archive-preview', runId: run.runId }, { ...f.owner, id: 'other' }), /owner/);
+  await assert.rejects(f.call({ action: 'list', includeArchived: 'yes' }), /includeArchived.*boolean/);
+  await assert.rejects(f.call({ action: 'status', runId: run.runId, includeArchived: true }), /includeArchived.*list/);
+  await f.call({ action: 'archive', runId: run.runId });
+  const list = await f.call({ action: 'list', includeArchived: true });
+  assert.equal(list.runs[0].isArchived, true); assert.ok(list.runs[0].archivedAt);
+  assert.equal((await f.call({ action: 'list', includeArchived: true }, { ...f.owner, id: 'other' })).runs.length, 0);
+  const protectedPreview = await f.call({ action: 'archive-preview', runId: run.runId }); assert.equal(protectedPreview.eligible, false); assert.match(protectedPreview.protectedReason, /archived/);
+  await f.call({ action: 'restore', runId: run.runId });
+  const resumed = await f.call({ action: 'resume', runId: run.runId }); await finished(f, resumed.runId);
+  assert.match((await f.call({ action: 'archive-preview', runId: run.runId })).protectedReason, /ancestry/);
+});
+
+test('rework status misclassification cannot cancel active work at routing hook', async t => {
+  let release; const gate = new Promise(r => release = r);
+  const f = await fixture(t, async () => { await gate; return 'done'; }, undefined, { native: true, config: { globalEnabled: true } });
+  f.owner.session = { header: {}, requestHeader: () => ({ config: { provider: 'unit', model: 'unit' } }) };
+  f.services.llm = { async *stream() { yield { type: 'text-delta', text: '{"action":"revise"}' }; } };
+  let interrupts = 0; const interrupt = f.services.subagents.interrupt;
+  f.services.subagents.interrupt = (...args) => { interrupts++; return interrupt(...args); };
+  await f.write({ id: 'status-rework', nodes: [{ id: 'a', agentId: 'a', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  let routed;
+  try {
+    for (let i = 0; !f.requests.length && i < 100; i++) await new Promise(r => setTimeout(r, 1));
+    const hook = [...f.listeners.get('agent/pre-step')][0];
+    for (const text of ['What is the current progress?', 'status please', '进度怎么样？']) {
+      const messages = [{ id: text, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] }];
+      routed = hook({ agent: f.owner, messages }, async () => ({ kind: 'enter', messages }));
+      await Promise.race([routed, new Promise(r => setTimeout(r, 15))]);
+      assert.equal(interrupts, 0); assert.equal((await f.call({ action: 'status', runId: run.runId })).status, 'running');
+    }
+  } finally { release(); await routed; }
+  await finished(f, run.runId);
+});
+
+for (const action of ['run', 'resume', 'revise']) test(`rework ${action} rejects denied/deleted inputs and retains original capsule`, async t => {
+  const f = await fixture(t, undefined, undefined, { native: true });
+  const path = join(f.root, 'input.txt'); await writeFile(path, 'one');
+  await f.write({ id: `inputs-rework-${action}`, inputFiles: ['input.txt'], nodes: [{ id: 'a', agentId: 'a', prompt: 'a' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const first = await finished(f, run.runId);
+  const args = { action, ...(action === 'run' ? {} : { runId: run.runId }), ...(action === 'resume' ? {} : { workflowPath: 'flow.json' }) };
+  const read = f.services.fs.readBytes;
+  f.services.fs.readBytes = (target, ...rest) => { if (target.targetKey.endsWith('input.txt')) throw Error('input policy denied'); return read(target, ...rest); };
+  await assert.rejects(f.call(args), /input policy denied/);
+  f.services.fs.readBytes = read; await rm(path);
+  await assert.rejects(f.call(args), /Cannot refresh inputFiles/);
+  assert.equal(f.requests.length, 1); assert.equal((await f.call({ action: 'status', runId: run.runId })).nodes.a.agentSessionId, first.nodes.a.agentSessionId);
+});
+
+test('archived prior cannot erase a rejected non-retrySafe execution on same-path run', async t => {
+  let possibleEffects = 0;
+  const f = await fixture(t, async () => { possibleEffects++; throw Error('submitted operation but receipt is unavailable'); });
+  await f.write({ id: 'archived-rejection', nodes: [{ id: 'a', prompt: 'submit operation' }] });
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  assert.equal((await finished(f, run.runId)).status, 'failed');
+  assert.equal(possibleEffects, 1);
+  await f.call({ action: 'archive', runId: run.runId });
+  assert.equal((await f.call({ action: 'archive-read', runId: run.runId, nodeId: 'a' })).node.status, 'failed');
+  await assert.rejects(f.call({ action: 'run', workflowPath: './flow.json' }), /archived.*restore|restore.*archived/i);
+  assert.equal(possibleEffects, 1); assert.equal(f.requests.length, 1);
+  await f.call({ action: 'restore', runId: run.runId });
+  const resumed = await f.call({ action: 'run', workflowPath: 'flow.json' });
+  assert.equal((await finished(f, resumed.runId)).status, 'needs_review');
+  assert.equal(possibleEffects, 1); assert.equal(f.requests.length, 1);
+});
+
+test('completed archived prior requires restore even for a new workflow ID and retains capsule identity', async t => {
+  const f = await fixture(t, async () => 'completed', undefined, { native: true });
+  const workflow = { id: 'archived-completed', nodes: [{ id: 'a', agentId: 'worker', prompt: 'a' }] };
+  await f.write(workflow);
+  const run = await f.call({ action: 'run', workflowPath: 'flow.json' }); const first = await finished(f, run.runId);
+  await f.call({ action: 'archive', runId: run.runId }); await f.unload(); await f.restart();
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /archived.*restore|restore.*archived/i);
+  await f.write({ ...workflow, id: 'intentional-new-workflow' });
+  await assert.rejects(f.call({ action: 'run', workflowPath: 'flow.json' }), /archived.*restore|restore.*archived/i);
+  assert.equal(f.requests.length, 1);
+  const archived = await f.call({ action: 'archive-read', runId: run.runId });
+  assert.equal(archived.nodes.a.agentSessionId, first.nodes.a.agentSessionId);
+  await f.write(workflow); await f.call({ action: 'restore', runId: run.runId });
+  const next = await f.call({ action: 'run', workflowPath: 'flow.json' }); const last = await finished(f, next.runId);
+  assert.equal(last.status, 'completed'); assert.equal(last.nodes.a.reused, true);
+  assert.equal(last.nodes.a.agentSessionId, first.nodes.a.agentSessionId); assert.equal(f.requests.length, 1);
 });

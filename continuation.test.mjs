@@ -234,7 +234,9 @@ for (const [label, role, expected] of [
   assert.deepEqual(f.child.ctx.availableTools(), expected);
   assert.equal(f.child.ctx.denied('write'), role.tools !== undefined);
   assert.equal(f.child.ctx.denied('scope-local'), role.tools !== undefined);
-  assert.equal(f.child.ctx.denied('run_code'), false);
+  // An empty policy is a genuine no-tool node, so the PTC transport itself is denied.
+  const transportOpen = role.tools === undefined || role.tools.length > 0;
+  assert.equal(f.child.ctx.denied('run_code'), !transportOpen);
   assert.equal(f.child.ctx.denied('run_code', {}), role.tools !== undefined);
   assert.equal(f.child.ctx.denied('read', {}), role.tools !== undefined && !role.tools.includes('read'));
   assert.deepEqual(f.ctx.roleText(), []);
@@ -245,13 +247,34 @@ for (const [label, role, expected] of [
   assert.equal(f.child.ctx.registrations(), 0);
 });
 
+test('an empty tool policy denies the PTC transport so a no-tool node cannot execute code', () => {
+  const f = fixture();
+  const off = installNodeRole(f.ctx, f.child, { prompt: 'No tools', tools: [] });
+  assert.deepEqual(f.child.ctx.availableTools(), []);
+  for (const parent of [undefined, Symbol('transport'), Symbol('wrapper')]) {
+    assert.equal(f.child.ctx.denied('run_code', parent), true);
+  }
+  off();
+  assert.equal(f.child.ctx.denied('run_code'), false);
+  assert.equal(f.child.ctx.registrations(), 0);
+});
+
+test('a non-empty tool policy keeps the PTC transport reachable for nested dispatch only', () => {
+  const f = fixture();
+  const off = installNodeRole(f.ctx, f.child, { tools: ['read'] });
+  assert.equal(f.child.ctx.denied('run_code'), false);
+  assert.equal(f.child.ctx.denied('run_code', Symbol('nested')), true);
+  assert.equal(f.child.ctx.denied('read', Symbol('nested')), false);
+  off();
+});
+
 for (const live of [false, true]) test(`role is installed before ${live ? 'live' : 'cold'} request admission and restored on native end`, async () => {
   const gate = deferred(), f = fixture({ live, sendGate: gate });
   const run = f.run({ role: { prompt: 'Activation only', tools: [] } });
   await tick();
   assert.deepEqual(f.child.ctx.roleText(), ['Activation only']);
   assert.deepEqual(f.child.ctx.availableTools(), []);
-  assert.equal(f.child.ctx.denied('run_code'), false);
+  assert.equal(f.child.ctx.denied('run_code'), true);
   gate.resolve(); await tick();
   await f.end();
   assert.deepEqual(f.child.ctx.roleText(), []);
@@ -312,4 +335,27 @@ test('cleanup failure rejects dispose while result remains handled', async () =>
   const f = fixture({ drainError: new Error('drain failed') }); const run = f.run(); await tick();
   await assert.rejects(run.dispose(), /drain failed/);
   assert.equal((await run.result).stopReason, 'error'); assert.equal(f.ctx.count() + f.child.ctx.count(), 0);
+});
+
+test('reserved PTC transport never authorizes nested run_code or wrapper bypasses', () => {
+  const f = fixture();
+  const restrict = f.child.ctx.tools.restrict;
+  f.child.ctx.tools.restrict = spec => restrict({ allow: spec.allow.filter(name => name !== 'run_code') });
+  const off = installNodeRole(f.ctx, f.child, { tools: ['read', 'run_code'] });
+  assert.equal(f.child.ctx.denied('run_code'), false);
+  assert.equal(f.child.ctx.denied('run_code', Symbol('transport')), true);
+  for (const parent of [undefined, Symbol('transport'), Symbol('wrapper')]) {
+    assert.equal(f.child.ctx.denied('Bash', parent), true);
+    assert.equal(f.child.ctx.denied('write', parent), true);
+    assert.equal(f.child.ctx.denied('wrapper', parent), true);
+  }
+  off();
+});
+
+test('same child cannot accept concurrent continuation activations', async () => {
+  const f = fixture();
+  const first = f.run(); await tick();
+  const second = f.run();
+  assert.equal((await second.result).stopReason, 'error');
+  await f.end('done'); await first.result;
 });

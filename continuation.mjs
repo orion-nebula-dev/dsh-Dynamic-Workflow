@@ -3,6 +3,7 @@ import { z } from 'zod';
 const messageOf = error => error instanceof Error ? error.message : String(error);
 
 const activeRoles = new WeakMap();
+const activations = new WeakMap();
 
 /** Replace one child's current activation policy. Never register on the parent scope. */
 export function installNodeRole(ctx, agent, role = {}) {
@@ -24,13 +25,20 @@ export function installNodeRole(ctx, agent, role = {}) {
           name: 'dynamic-workflow:node-role', order: 1000, text: role.prompt, interpolate: false,
         }));
         if (role.tools !== undefined) {
-          const allowed = new Set(role.tools);
+          const allowed = new Set(role.tools.filter(name => name !== 'run_code'));
           const legacyNative = typeof agent.ctx.tools.presentAs === 'function';
           if (legacyNative) removers.push(agent.ctx.tools.presentAs('native'));
           removers.push(agent.ctx.tools.restrict({ allow: [...allowed] }));
-          // New PTC keeps top-level run_code as its transport; only nested calls need the role guard.
+          // New PTC keeps top-level run_code as its transport so a non-empty role policy can reach
+          // its nested tools. An empty policy (tools: []) must not keep that transport: run_code
+          // executes arbitrary JavaScript, so leaving it open grants filesystem and subprocess
+          // access to a node that declared no tools at all.
           // Legacy presentAs switches to native execution, so its transport remains denied.
-          removers.push(agent.ctx.tools.guard(exec => ((!legacyNative && exec.name === 'run_code' && exec.parent === undefined) || allowed.has(exec.name)) ? undefined : 'Tool is unavailable in this workflow activation'));
+          const transportAllowed = !legacyNative && allowed.size > 0;
+          removers.push(agent.ctx.tools.guard(exec => {
+            const transport = transportAllowed && exec.name === 'run_code' && exec.parent === undefined;
+            return transport || allowed.has(exec.name) ? undefined : 'Tool is unavailable in this workflow activation';
+          }));
         }
         return cleanup;
       } catch (error) { cleanup(); throw error; }
@@ -43,6 +51,10 @@ export function installNodeRole(ctx, agent, role = {}) {
 
 /** Continue one verified continuable child. The caller owns admission and persistence checks. */
 export function continueNodeSession({ ctx, owner, childId, prompt, selection = {}, schema, role, signal, subagents, agents }) {
+  let claimed = activations.get(subagents);
+  if (!claimed) activations.set(subagents, claimed = new Set());
+  if (claimed.has(childId)) return { result: Promise.resolve({ stopReason: 'error', error: `Child ${childId} activation is locked` }), cancel() {}, async dispose() {} };
+  claimed.add(childId);
   const controller = new AbortController();
   const route = Object.fromEntries(['provider', 'model'].filter(key => selection[key] !== undefined).map(key => [key, selection[key]]));
   const disposers = [];
@@ -132,6 +144,7 @@ export function continueNodeSession({ ctx, owner, childId, prompt, selection = {
     } catch (error) {
       return cancelled && !cleanupError ? { stopReason: 'cancelled' } : { stopReason: 'error', error: messageOf(error) };
     } finally {
+      claimed.delete(childId);
       finished = true;
       clearListeners();
     }
